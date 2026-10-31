@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <WebSocketsServer.h>
 #include <WiFi.h>
+#include <cstring>
 
 #if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32S3
 #if ARDUINO_USB_CDC_ON_BOOT
@@ -19,15 +20,47 @@ class WebSerialConsole : public Stream {
 public:
     typedef std::function<bool(const String& cmd)> CommandHandler;
 
+    // Output categories. The numeric order is also used as the index of the
+    // per-source line buffers, so keep it stable.
+    enum class Source : uint8_t {
+        DEBUG = 0,
+        HA    = 1,
+        USER  = 2,
+        SLAVE = 3
+    };
+    static constexpr uint8_t SOURCE_COUNT = 4;
+
+    // Temporarily tag everything written through Serial with a source.
+    class Scope {
+    public:
+        Scope(WebSerialConsole& console, Source source)
+            : _console(console), _previous(console.source()) {
+            _console.setSource(source);
+        }
+        ~Scope() { _console.setSource(_previous); }
+
+        Scope(const Scope&) = delete;
+        Scope& operator=(const Scope&) = delete;
+
+    private:
+        WebSerialConsole& _console;
+        Source _previous;
+    };
+
 private:
     WebSocketsServer* _ws = nullptr;
     CommandHandler _customCmdHandler = nullptr;
 
-    // Outgoing buffer for WebSocket broadcast
-    static const size_t TX_BUF_SIZE = 512;
-    char _txBuffer[TX_BUF_SIZE];
-    size_t _txLen = 0;
-    unsigned long _lastTxTime = 0;
+    static const size_t LINE_BUF_SIZE = 256;
+    static const size_t SCROLLBACK_SIZE = 4096;
+
+    Source _source = Source::DEBUG;
+
+    // One partially received line per source, so output from different
+    // sources can never be mixed into a single terminal line.
+    char _lineBuffer[SOURCE_COUNT][LINE_BUF_SIZE];
+    size_t _lineLen[SOURCE_COUNT] = {};
+    unsigned long _lineLastMs[SOURCE_COUNT] = {};
 
     // Incoming RX ring buffer (fed by WebSocket or USB CDC)
     static const size_t RX_BUF_SIZE = 512;
@@ -35,13 +68,13 @@ private:
     volatile size_t _rxHead = 0;
     volatile size_t _rxTail = 0;
 
-    // Recent output scrollback for newly connected clients
-    static const size_t SCROLLBACK_SIZE = 2048;
+    // Recent output scrollback. Stored as already-tagged lines, so it can be
+    // replayed verbatim to a newly connected client.
     char _scrollback[SCROLLBACK_SIZE];
     size_t _scrollbackLen = 0;
 
 public:
-    WebSerialConsole() : _txLen(0), _lastTxTime(0), _rxHead(0), _rxTail(0), _scrollbackLen(0) {}
+    WebSerialConsole() {}
 
     void begin(unsigned long baud = 115200) {
         WebSerialDetail::getHWSerial().begin(baud);
@@ -60,19 +93,24 @@ public:
         _customCmdHandler = handler;
     }
 
+    Source source() const { return _source; }
+    void setSource(Source source) { _source = source; }
+
+    // Emit one complete line under the given source. Also goes to the
+    // hardware UART so the USB console stays in sync.
+    void logLine(Source source, const String& text) {
+        Scope scope(*this, source);
+        write((const uint8_t*)text.c_str(), text.length());
+        write('\n');
+    }
+
     // Stream & Print interface implementation
     virtual size_t write(uint8_t c) override {
         // 1. Output to physical hardware USB serial port immediately
         WebSerialDetail::getHWSerial().write(c);
 
-        // 2. Save in recent scrollback buffer
-        appendToScrollback((char)c);
-
-        // 3. Buffer for WebSocket broadcast
-        _txBuffer[_txLen++] = (char)c;
-        if (_txLen >= TX_BUF_SIZE - 1 || c == '\n') {
-            flushWs();
-        }
+        // 2. Buffer the character for the WebSocket line currently being built
+        emitChar((char)c);
         return 1;
     }
 
@@ -107,48 +145,129 @@ public:
 
     virtual void flush() override {
         WebSerialDetail::getHWSerial().flush();
-        flushWs();
     }
 
     operator bool() const {
         return (bool)WebSerialDetail::getHWSerial();
     }
 
-    // Main service loop: handle websockets, read hardware serial, flush TX
+    // Main service loop: handle websockets and forward USB CDC input.
     void loop() {
         if (_ws) {
             _ws->loop();
         }
 
-        // Forward any data typed in hardware Serial (USB CDC) to WebSocket and RX buffer
-        while (WebSerialDetail::getHWSerial().available()) {
-            int c = WebSerialDetail::getHWSerial().read();
-            if (c >= 0) {
-                appendToScrollback((char)c);
-                _txBuffer[_txLen++] = (char)c;
-                if (_txLen >= TX_BUF_SIZE - 1 || c == '\n') {
-                    flushWs();
-                }
-                pushRx((uint8_t)c);
+        // Flush stale partial lines (a print without a trailing newline).
+        // USER is excluded: slow typing on the hardware console must stay in
+        // one line until Enter is pressed.
+        unsigned long now = millis();
+        for (uint8_t i = 0; i < SOURCE_COUNT; i++) {
+            if ((Source)i == Source::USER) continue;
+            if (_lineLen[i] > 0 && now - _lineLastMs[i] >= 25) {
+                flushLine((Source)i);
             }
         }
 
-        // Periodically flush any un-flushed characters after 25ms
-        if (_txLen > 0 && (millis() - _lastTxTime >= 25)) {
-            flushWs();
+        // Everything typed on the hardware serial console belongs to the
+        // USER category and must also be readable through Serial.read().
+        if (WebSerialDetail::getHWSerial().available()) {
+            Scope scope(*this, Source::USER);
+            while (WebSerialDetail::getHWSerial().available()) {
+                int c = WebSerialDetail::getHWSerial().read();
+                if (c >= 0) {
+                    emitChar((char)c);
+                    pushRx((uint8_t)c);
+                }
+            }
         }
     }
 
 private:
-    void appendToScrollback(char c) {
-        if (_scrollbackLen < SCROLLBACK_SIZE - 1) {
-            _scrollback[_scrollbackLen++] = c;
-        } else {
-            const size_t shift = 512;
-            memmove(_scrollback, _scrollback + shift, SCROLLBACK_SIZE - shift);
-            _scrollbackLen = SCROLLBACK_SIZE - shift;
-            _scrollback[_scrollbackLen++] = c;
+    static char tagFor(Source source) {
+        switch (source) {
+            case Source::HA:    return 'H';
+            case Source::USER:  return 'U';
+            case Source::SLAVE: return 'S';
+            default:            return 'D';
         }
+    }
+
+    void emitChar(char c) {
+        uint8_t idx = (uint8_t)_source;
+        if (idx >= SOURCE_COUNT) idx = 0;
+
+        if (c == '\r' || c == '\n') {
+            if (_lineLen[idx] > 0) flushLine((Source)idx);
+            return;
+        }
+
+        if (_lineLen[idx] >= LINE_BUF_SIZE - 1) {
+            flushLine((Source)idx);
+        }
+
+        _lineBuffer[idx][_lineLen[idx]++] = c;
+        _lineLastMs[idx] = millis();
+    }
+
+    void flushLine(Source source) {
+        uint8_t idx = (uint8_t)source;
+        size_t len = _lineLen[idx];
+        if (len == 0) return;
+
+        _lineBuffer[idx][len] = '\0';
+        broadcastTagged(source, _lineBuffer[idx], len);
+        _lineLen[idx] = 0;
+    }
+
+    // Wire format: 0x01 <tag> <line text> '\n'
+    //   H = Home Assistant request, U = user command,
+    //   S = slave response, D = debug output.
+    void broadcastTagged(Source source, const char* text, size_t len) {
+        char out[LINE_BUF_SIZE + 3];
+        out[0] = '\x01';
+        out[1] = tagFor(source);
+        memcpy(out + 2, text, len);
+        out[len + 2] = '\n';
+        size_t total = len + 3;
+
+        appendToScrollback(out, total);
+
+        if (_ws && _ws->connectedClients() > 0) {
+            _ws->broadcastTXT((uint8_t*)out, total);
+        }
+    }
+
+    void appendToScrollback(const char* data, size_t len) {
+        if (len == 0) return;
+
+        if (len >= SCROLLBACK_SIZE) {
+            data += len - (SCROLLBACK_SIZE - 1);
+            len = SCROLLBACK_SIZE - 1;
+        }
+
+        if (_scrollbackLen + len > SCROLLBACK_SIZE - 1) {
+            size_t overflow = _scrollbackLen + len - (SCROLLBACK_SIZE - 1);
+            size_t drop = overflow;
+            // Do not start the replay in the middle of a tagged line.
+            while (drop < _scrollbackLen && _scrollback[drop - 1] != '\n') drop++;
+            if (drop > _scrollbackLen) drop = _scrollbackLen;
+
+            memmove(_scrollback, _scrollback + drop, _scrollbackLen - drop);
+            _scrollbackLen -= drop;
+        }
+
+        memcpy(_scrollback + _scrollbackLen, data, len);
+        _scrollbackLen += len;
+    }
+
+    String taggedLine(Source source, const String& text) {
+        String out;
+        out.reserve(text.length() + 3);
+        out += (char)0x01;
+        out += tagFor(source);
+        out += text;
+        out += '\n';
+        return out;
     }
 
     void pushRx(uint8_t b) {
@@ -159,29 +278,27 @@ private:
         }
     }
 
-    void flushWs() {
-        if (_txLen > 0 && _ws != nullptr && _ws->connectedClients() > 0) {
-            _ws->broadcastTXT((uint8_t*)_txBuffer, _txLen);
-        }
-        _txLen = 0;
-        _lastTxTime = millis();
-    }
-
     void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
         switch (type) {
             case WStype_DISCONNECTED: {
-                WebSerialDetail::getHWSerial().printf("[WebSerial] Client #%u disconnected\n", num);
+                logLine(Source::DEBUG, "[WebSerial] Client #" + String(num) + " disconnected");
                 break;
             }
             case WStype_CONNECTED: {
                 IPAddress ip = _ws->remoteIP(num);
-                WebSerialDetail::getHWSerial().printf("[WebSerial] Client #%u connected from %s\n", num, ip.toString().c_str());
+                // Keep this off the web stream: the client receives the same
+                // information in its welcome banner below.
+                WebSerialDetail::getHWSerial().printf(
+                    "[WebSerial] Client #%u connected from %s\n", num, ip.toString().c_str());
 
-                // Welcome message
-                String banner = "\r\n=== Connected to ESP32-C3 Web Serial Console ===\r\n";
-                banner += "IP: " + WiFi.localIP().toString() + " | Free Heap: " + String(ESP.getFreeHeap()) + " B\r\n";
-                banner += "Type 'help' for available commands.\r\n";
-                banner += "=================================================\r\n";
+                // Welcome message, tagged as debug/system output
+                String banner;
+                banner += taggedLine(Source::DEBUG, "=== Connected to ESP32-C3 Web Serial Console ===");
+                banner += taggedLine(Source::DEBUG,
+                                     "IP: " + WiFi.localIP().toString() +
+                                     " | Free Heap: " + String(ESP.getFreeHeap()) + " B");
+                banner += taggedLine(Source::DEBUG, "Type 'help' for available commands.");
+                banner += taggedLine(Source::DEBUG, "=================================================");
                 _ws->sendTXT(num, banner);
 
                 // Send recent scrollback if available
@@ -199,10 +316,14 @@ private:
                     text += (char)payload[i];
                 }
 
-                WebSerialDetail::getHWSerial().printf("[WebConsole IN]: %s\n", text.c_str());
-
                 String cmd = text;
                 cmd.trim();
+
+                // Echo the typed command to every client (including this one)
+                // as a USER line, so it is filtered/exported like any other.
+                if (cmd.length() > 0) {
+                    logLine(Source::USER, cmd);
+                }
 
                 if (cmd.equalsIgnoreCase("help")) {
                     println("\r\n--- Built-in Console Commands ---");

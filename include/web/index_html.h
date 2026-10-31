@@ -23,6 +23,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
     --status-yellow: #f59e0b;
     --cmd-color: #38bdf8;
     --sys-color: #a78bfa;
+    --ha-color: #c084fc;
+    --slave-color: #34d399;
+    --debug-color: #94a3b8;
     --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   }
 
@@ -221,15 +224,89 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
     background: var(--border-color);
   }
 
+  /* Source categories */
+  .line-ha {
+    color: var(--ha-color);
+  }
+
   .line-user {
     color: var(--cmd-color);
     font-weight: 600;
+  }
+
+  .line-slave {
+    color: var(--slave-color);
+  }
+
+  .line-debug {
+    color: var(--debug-color);
   }
 
   .line-sys {
     color: var(--sys-color);
     font-style: italic;
   }
+
+  .src-tag {
+    display: inline-block;
+    min-width: 2.7em;
+    text-align: center;
+    font-family: var(--font-mono);
+    font-size: 0.64rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    padding: 0 4px;
+    margin-right: 6px;
+    border-radius: 3px;
+    border: 1px solid currentColor;
+    opacity: 0.85;
+    user-select: none;
+  }
+
+  .tag-ha { color: var(--ha-color); }
+  .tag-user { color: var(--cmd-color); }
+  .tag-slave { color: var(--slave-color); }
+  .tag-debug { color: var(--debug-color); }
+
+  /* Source visibility filters */
+  #terminal.hide-ha .src-ha,
+  #terminal.hide-user .src-user,
+  #terminal.hide-slave .src-slave,
+  #terminal.hide-debug .src-debug {
+    display: none;
+  }
+
+  .filter-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    padding: 2px 9px;
+    border-radius: 9999px;
+    border: 1px solid currentColor;
+    background: transparent;
+    cursor: pointer;
+    user-select: none;
+    opacity: 0.4;
+    transition: opacity 0.15s ease, background-color 0.15s ease;
+  }
+
+  .filter-chip input {
+    display: none;
+  }
+
+  .filter-chip.active {
+    opacity: 1;
+    background-color: rgba(255, 255, 255, 0.06);
+  }
+
+  .filter-ha { color: var(--ha-color); }
+  .filter-user { color: var(--cmd-color); }
+  .filter-slave { color: var(--slave-color); }
+  .filter-debug { color: var(--debug-color); }
 
   .timestamp {
     color: var(--text-muted);
@@ -377,7 +454,20 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
 </main>
 
 <div class="macro-bar">
-  <span class="macro-label">Quick cmds:</span>
+  <span class="macro-label">Sources:</span>
+  <label class="filter-chip filter-ha active" title="Home Assistant requests">
+    <input type="checkbox" id="fHa" checked>HA
+  </label>
+  <label class="filter-chip filter-user active" title="Commands typed in the console">
+    <input type="checkbox" id="fUser" checked>CMD
+  </label>
+  <label class="filter-chip filter-slave active" title="RS485 slave responses">
+    <input type="checkbox" id="fSlave" checked>SLV
+  </label>
+  <label class="filter-chip filter-debug active" title="Firmware debug prints">
+    <input type="checkbox" id="fDebug" checked>DBG
+  </label>
+  <span class="macro-label" style="margin-left:12px">Quick cmds:</span>
   <button class="pill-btn" onclick="sendCommand('help')">help</button>
   <button class="pill-btn" onclick="sendCommand('ip')">ip</button>
   <button class="pill-btn" onclick="sendCommand('heap')">heap</button>
@@ -410,6 +500,11 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
   let historyIdx = -1;
   const MAX_LINES = 2500;
 
+  // Tagged-line protocol: 0x01 <tag> <text> '\n'
+  const SOURCE_TAGS = { H: 'ha', U: 'user', S: 'slave', D: 'debug' };
+  const SOURCE_LABELS = { ha: 'HA', user: 'CMD', slave: 'SLV', debug: 'DBG' };
+  let rxBuffer = '';
+
   const terminal = document.getElementById('terminal');
   const statusBadge = document.getElementById('statusBadge');
   const statusText = document.getElementById('statusText');
@@ -421,6 +516,12 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
   const clearBtn = document.getElementById('clearBtn');
   const exportBtn = document.getElementById('exportBtn');
   const sendBtn = document.getElementById('sendBtn');
+  const filterCbs = {
+    ha: document.getElementById('fHa'),
+    user: document.getElementById('fUser'),
+    slave: document.getElementById('fSlave'),
+    debug: document.getElementById('fDebug')
+  };
 
   function getTimestamp() {
     const d = new Date();
@@ -461,35 +562,50 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
     scrollTerminal();
   }
 
-  function appendRawText(text) {
-    // Process text line by line for timestamping if enabled
-    if (!timestampsCb.checked) {
-      appendSpan(ansiToHtml(text));
-      return;
-    }
+  function appendSourceLine(src, text) {
+    if (!atLineStart) appendSpan('\n');
 
-    const lines = text.split('\n');
-    for (let i = 0; i < lines.length; i++) {
-      let line = lines[i];
-      if (i > 0) {
-        appendSpan('\n');
-        atLineStart = true;
-      }
-      if (line.length > 0) {
-        if (atLineStart) {
-          appendSpan(getTimestamp(), 'timestamp');
-          atLineStart = false;
-        }
-        appendSpan(ansiToHtml(line));
-      }
-    }
+    // User commands are shown with a prompt, whether they were typed in the
+    // web console or on the physical USB serial console.
+    const body = (src === 'user') ? ('> ' + text) : text;
+
+    const ts = timestampsCb.checked
+      ? `<span class="timestamp">${getTimestamp()}</span>`
+      : '';
+    const tag = `<span class="src-tag tag-${src}">${SOURCE_LABELS[src]}</span>`;
+    appendSpan(ts + tag + ' ' + ansiToHtml(body) + '\n', `line-${src} src-${src}`);
+    atLineStart = true;
   }
 
-  function appendUserLine(text) {
-    if (!atLineStart) appendSpan('\n');
-    if (timestampsCb.checked) appendSpan(getTimestamp(), 'timestamp');
-    appendSpan(ansiToHtml(text) + '\n', 'line-user');
-    atLineStart = true;
+  function handleIncoming(data) {
+    rxBuffer += data;
+
+    let nl;
+    while ((nl = rxBuffer.indexOf('\n')) !== -1) {
+      const raw = rxBuffer.slice(0, nl);
+      rxBuffer = rxBuffer.slice(nl + 1);
+
+      let src = 'debug';
+      let text = raw;
+      if (raw.charCodeAt(0) === 1 && raw.length >= 2) {
+        src = SOURCE_TAGS[raw[1]] || 'debug';
+        text = raw.slice(2);
+      }
+
+      appendSourceLine(src, text);
+    }
+
+    // Do not let a missing terminator grow without bound.
+    if (rxBuffer.length > 8192) rxBuffer = '';
+  }
+
+  function applySourceFilters() {
+    for (const [src, cb] of Object.entries(filterCbs)) {
+      if (!cb) continue;
+      terminal.classList.toggle('hide-' + src, !cb.checked);
+      const chip = cb.closest('.filter-chip');
+      if (chip) chip.classList.toggle('active', cb.checked);
+    }
   }
 
   function appendSystemLine(text) {
@@ -530,13 +646,14 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
     }
 
     ws.onopen = () => {
+      rxBuffer = '';
       updateStatus('connected', 'Connected');
       appendSystemLine(`[WebSocket connected to ${wsUrl}]`);
     };
 
     ws.onmessage = (event) => {
       if (isPaused) return;
-      appendRawText(event.data);
+      handleIncoming(event.data);
     };
 
     ws.onclose = () => {
@@ -567,7 +684,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
       cmdInput.value = '';
     }
 
-    appendUserLine('> ' + text);
+    // The command is echoed back by the firmware as a USER line, so it is
+    // displayed (and filtered/exported) like every other source.
 
     let payload = text;
     const le = lineEndingSelect.value;
@@ -601,8 +719,14 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
     }
   };
 
+  for (const cb of Object.values(filterCbs)) {
+    if (cb) cb.addEventListener('change', applySourceFilters);
+  }
+  applySourceFilters();
+
   exportBtn.onclick = () => {
-    const text = terminal.innerText;
+    // textContent includes filtered-out lines, so the log stays complete.
+    const text = terminal.textContent;
     const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);

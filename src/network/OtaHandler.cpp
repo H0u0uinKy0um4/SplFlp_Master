@@ -1,35 +1,19 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include "protocol_handler.h"
+#include "network/OtaHandler.h"
 #include "secrets.h"
 #include <ArduinoOTA.h>
+#include <PubSubClient.h>
 
-const char *ssid = WIFI_SSID;
-const char *password = WIFI_PASSWORD;
-const char* ota_ssid = OTA_PASSWORD;
 
-void connectWifi() {
-  Serial.println("Connecting to WiFi...");
-  WiFi.setSleep(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(100);
-  }
-  WiFi.setTxPower(WIFI_POWER_15dBm); 
-  Serial.println("\nWiFi Connected!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-}
+const char* ota_password = OTA_PASSWORD;
+
 
 void setupOTA()
 {
   ArduinoOTA.setPort(3232);
   ArduinoOTA.setHostname("SplFlp_Master");
   
-  ArduinoOTA.setPassword(ota_ssid);
+  ArduinoOTA.setPassword(ota_password);
   ArduinoOTA
   .onStart([]() {
     Serial.println("OTA: Update started");
@@ -61,3 +45,5 @@ void setupOTA()
   ArduinoOTA.begin();
   return;
 }
+
+

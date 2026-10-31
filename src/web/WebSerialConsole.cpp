@@ -1,4 +1,4 @@
 #define NO_WEB_SERIAL_REDEFINE
-#include "WebSerialConsole.h"
+#include "web/WebSerialConsole.h"
 
 WebSerialConsole WebSerial;
