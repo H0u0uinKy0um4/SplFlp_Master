@@ -138,6 +138,41 @@ bool Display::sendQueryAndWait(uint16_t id, uint16_t timeoutMs, Module &mod)
     }
 
     delay(BUS_RELEASE_MS);
+
+    // Try to query state for position info
+    {
+        String stateQuery;
+        stateQuery += 'm';
+        stateQuery += String(id);
+        stateQuery += 's';
+        rs485Reset();
+        rs485Send(stateQuery);
+        unsigned long startTime2 = millis();
+        while (millis() - startTime2 < timeoutMs || rs485RxBusy()) {
+            String resp = rs485read();
+            if (resp.length() > 0) {
+                // Expected format: m<id>s:<pos>:<busy>:<posknown> or similar
+                int lastColon = resp.lastIndexOf(':');
+                if (lastColon >= 0) {
+                    String posStr = resp.substring(resp.lastIndexOf(':', lastColon-1) + 1, lastColon);
+                    // Try to extract pos - look for number
+                    int p1 = resp.indexOf(':');
+                    int p2 = resp.indexOf(':', p1+1);
+                    if (p1 >= 0 && p2 >= 0 && p2 > p1) {
+                        String posPart = resp.substring(p1+1, p2);
+                        // might be like m3s:pos:busy:known or different; also try our format m<id>s:pos:busy:known
+                        if (posPart.indexOf(':') < 0) {
+                            mod.currentPos = posPart.toInt();
+                        }
+                    }
+                }
+                break;
+            }
+            yield();
+        }
+        delay(BUS_RELEASE_MS);
+    }
+
     return mod.online;
 }
 

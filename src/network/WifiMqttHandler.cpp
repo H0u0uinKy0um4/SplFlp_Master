@@ -6,6 +6,7 @@
 #include "secrets.h"
 #include "web/WebSerialConsole.h"
 #include "Display.h"
+#include "RS485.h"
 
 
 const char *wifi_ssid = WIFI_SSID;
@@ -22,6 +23,7 @@ String display_topic = String(topic_prefix) + "/command/display";
 String sync_topic    = String(topic_prefix) + "/command/sync";
 String scan_topic    = String(topic_prefix) + "/command/scan";
 String update_topic  = String(topic_prefix) + "/command/update";
+String calibrate_topic = String(topic_prefix) + "/command/calibrate";
 
 WiFiClient wifiClient;
 PubSubClient client(wifiClient);
@@ -214,6 +216,97 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
         publishStatus();
     }
+    // CALIBRATE COMMAND
+    else if (incomingTopic == calibrate_topic) {
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, message);
+        if (error) {
+            Serial.println("Failed to parse calibrate command");
+            return;
+        }
+        int moduleId = doc["module"] | doc["module_id"] | -1;
+        const char* action = doc["action"] | "";
+        if (moduleId <= 0) {
+            Serial.println("Invalid module id in calibrate command");
+            return;
+        }
+        String act = String(action);
+        act.toLowerCase();
+        if (act == "goto") {
+            if (doc["index"].is<int>()) {
+                String cmd = "m" + String(moduleId) + "+" + String(doc["index"].as<int>());
+                rs485Send(cmd);
+            } else if (doc["flap"].is<const char*>()) {
+                String cmd = "m" + String(moduleId) + "-" + String(doc["flap"].as<const char*>())[0];
+                rs485Send(cmd);
+            }
+        } else if (act == "home") {
+            String cmd = "m" + String(moduleId) + "h";
+            rs485Send(cmd);
+        } else if (act == "step") {
+            if (doc["steps"].is<int>()) {
+                String cmd = "m" + String(moduleId) + "g" + String(doc["steps"].as<int>());
+                rs485Send(cmd);
+            }
+        } else if (act == "record") {
+            if (doc["index"].is<int>()) {
+                int idx = doc["index"].as<int>();
+                // Try new protocol 'r' first
+                String cmd = "m" + String(moduleId) + "r" + String(idx);
+                rs485Send(cmd);
+                delay(80);
+                // For compatibility with old slaves, also try to write map entry and set home offset if index 0
+                // We don't know current position from master, but try to query state
+                String sCmd = "m" + String(moduleId) + "s";
+                rs485Send(sCmd);
+                delay(80);
+                // Also send write map command - some firmwares might use different format
+                if (idx == 0) {
+                    // Try to set home offset via 'o' with 0 or let it be handled by slave if it tracks current pos
+                    // Alternative: write map entry; old slave can get current position differently?
+                    String wCmd = "m" + String(moduleId) + "w" + String(idx) + ":0";
+                    rs485Send(wCmd);
+                    delay(50);
+                }
+            }
+        } else if (act == "apply") {
+            if (doc["home_offset"].is<int>() || doc["homeOffset"].is<int>()) {
+                int hoff = doc["home_offset"].is<int>() ? doc["home_offset"].as<int>() : doc["homeOffset"].as<int>();
+                String cmd = "m" + String(moduleId) + "o" + String(hoff);
+                rs485Send(cmd);
+                delay(50);
+            }
+            if (doc["clear_map"].is<bool>() && doc["clear_map"].as<bool>()) {
+                String cmd = "m" + String(moduleId) + "e*";
+                rs485Send(cmd);
+                delay(50);
+            }
+            if (doc["positions"].is<JsonObject>()) {
+                JsonObject pos = doc["positions"].as<JsonObject>();
+                for (JsonPair p : pos) {
+                    String cmd = "m" + String(moduleId) + "w" + String(p.key().c_str()) + ":" + String(p.value().as<int>());
+                    rs485Send(cmd);
+                    delay(30);
+                }
+            }
+            String homeCmd = "m" + String(moduleId) + "h";
+            rs485Send(homeCmd);
+        } else if (act == "clear_map" || act == "clearmap") {
+            String cmd = "m" + String(moduleId) + "e*";
+            rs485Send(cmd);
+        } else if (act == "refresh") {
+            splitflap.updateModules();
+            publishStatus();
+            return;
+        } else if (act == "get_pos" || act == "getpos" || act == "get_position") {
+            // Try to get position/state if supported
+            String cmd = "m" + String(moduleId) + "s";
+            rs485Send(cmd);
+        }
+        delay(100);
+        splitflap.updateModules();
+        publishStatus();
+    }
 }
 
 // Setup MQTT Server and Callback
@@ -241,6 +334,7 @@ void connectMqtt() {
       client.subscribe(sync_topic.c_str());
       client.subscribe(scan_topic.c_str());
       client.subscribe(update_topic.c_str());
+      client.subscribe(calibrate_topic.c_str());
 
     // Publish discovery configuration first
       publishDiscovery();
@@ -281,6 +375,11 @@ void publishStatus() {
         module["status"] = mod.status;
         module["home_offset"] = mod.homeOffset;
         module["auto_homing"] = mod.autoHome;
+        module["current_step"] = mod.currentPos;
+        module["current_pos"] = mod.currentPos;
+        module["pos"] = mod.currentPos;
+        module["busy"] = false;
+        module["position_known"] = mod.online;
 
         if (mod.flapList.length() > 0) {
             module["flap_list"] = mod.flapList;

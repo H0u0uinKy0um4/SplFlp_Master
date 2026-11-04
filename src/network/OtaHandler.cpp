@@ -3,6 +3,7 @@
 #include "secrets.h"
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
+#include "web/WebSerialConsole.h"
 
 
 const char* ota_password = OTA_PASSWORD;
