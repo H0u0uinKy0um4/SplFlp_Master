@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <esp_system.h>
 #include "RS485.h"
 #include "Config.h"
 #include "web/WebSerialConsole.h"
@@ -20,7 +19,7 @@ void setupRS485()
   pinMode(RS485_DE, OUTPUT);
   digitalWrite(RS485_DE, LOW);
   Serial1.begin(RS485_BAUD, SERIAL_8N1, RS485_RX, RS485_TX);
-  Serial.println("RS485 master readyS");
+  Serial.println("RS485 master ready");
 }
 
 void rs485Reset()
@@ -33,6 +32,20 @@ void rs485Reset()
 
 
 void rs485Send(const String &msg) {
+  // Log the outgoing command as a MASTER line before the bus is driven, so
+  // the console shows both sides of the exchange: the command here, the
+  // slave's answer later as a SLAVE line. Without this the queries are
+  // invisible and a response such as "m3s:2779:0:1" is easy to mistake for
+  // the master's own "m3s" status command. The arrow prefix keeps the
+  // direction readable on the raw USB console, where source tags do not
+  // exist. Print before DE goes high: buffered UART output, no bus delay.
+  {
+    WebSerialConsole::Scope scope(WebSerial, WebSerialConsole::Source::MASTER);
+    Serial.print("→ ");
+    Serial.print(msg);
+    if (!msg.endsWith("\n")) Serial.print("\n");
+  }
+
   rs485Reset();
   // The slave parser terminates on '\n' (or an idle gap). Always send an
   // explicit terminator so it reacts immediately instead of waiting for the

@@ -23,6 +23,7 @@ void setupWebServer() {
     webSocket.begin();
     WebSerial.attachWebSocket(&webSocket);
     Serial.print("Web Serial Console ready at: http://");
+    Serial.println(WiFi.localIP());
 }
 
 void handleWebServer() {

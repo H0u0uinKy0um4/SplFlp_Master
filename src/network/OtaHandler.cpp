@@ -2,7 +2,6 @@
 #include "network/OtaHandler.h"
 #include "secrets.h"
 #include <ArduinoOTA.h>
-#include <PubSubClient.h>
 #include "web/WebSerialConsole.h"
 
 
@@ -44,7 +43,6 @@ void setupOTA()
       }
     });
   ArduinoOTA.begin();
-  return;
 }
 
 

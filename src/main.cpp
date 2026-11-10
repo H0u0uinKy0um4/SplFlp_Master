@@ -1,12 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#include <esp_system.h>
 #include "web/WebSerialConsole.h"
 #include "network/OtaHandler.h"
 #include "network/WifiMqttHandler.h"
 #include "web/WebServerHandler.h"
-#include "ProtocolLayer.h"
 #include "RS485.h"
 #include "Display.h"
 
@@ -15,7 +13,10 @@ void setup() {
   delay(500);
 
   setupRS485();
-  connectWifi();
+  // Non-blocking WiFi start: if the router is not up yet (e.g. after a power
+  // cut), the device still boots fully and associates later from the main
+  // loop. The web console, OTA and RS485 keep working meanwhile.
+  beginWifi();
   setupMqtt();
   setupOTA();
   setupWebServer();

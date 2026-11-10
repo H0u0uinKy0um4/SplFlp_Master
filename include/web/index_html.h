@@ -25,6 +25,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
     --sys-color: #a78bfa;
     --ha-color: #c084fc;
     --slave-color: #34d399;
+    --master-color: #fbbf24;
     --debug-color: #94a3b8;
     --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   }
@@ -238,6 +239,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
     color: var(--slave-color);
   }
 
+  .line-master {
+    color: var(--master-color);
+  }
+
   .line-debug {
     color: var(--debug-color);
   }
@@ -266,12 +271,14 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
   .tag-ha { color: var(--ha-color); }
   .tag-user { color: var(--cmd-color); }
   .tag-slave { color: var(--slave-color); }
+  .tag-master { color: var(--master-color); }
   .tag-debug { color: var(--debug-color); }
 
   /* Source visibility filters */
   #terminal.hide-ha .src-ha,
   #terminal.hide-user .src-user,
   #terminal.hide-slave .src-slave,
+  #terminal.hide-master .src-master,
   #terminal.hide-debug .src-debug {
     display: none;
   }
@@ -306,6 +313,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
   .filter-ha { color: var(--ha-color); }
   .filter-user { color: var(--cmd-color); }
   .filter-slave { color: var(--slave-color); }
+  .filter-master { color: var(--master-color); }
   .filter-debug { color: var(--debug-color); }
 
   .timestamp {
@@ -461,6 +469,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
   <label class="filter-chip filter-user active" title="Commands typed in the console">
     <input type="checkbox" id="fUser" checked>CMD
   </label>
+  <label class="filter-chip filter-master active" title="RS485 commands sent by this master">
+    <input type="checkbox" id="fMaster" checked>MST
+  </label>
   <label class="filter-chip filter-slave active" title="RS485 slave responses">
     <input type="checkbox" id="fSlave" checked>SLV
   </label>
@@ -501,8 +512,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
   const MAX_LINES = 2500;
 
   // Tagged-line protocol: 0x01 <tag> <text> '\n'
-  const SOURCE_TAGS = { H: 'ha', U: 'user', S: 'slave', D: 'debug' };
-  const SOURCE_LABELS = { ha: 'HA', user: 'CMD', slave: 'SLV', debug: 'DBG' };
+  const SOURCE_TAGS = { H: 'ha', U: 'user', S: 'slave', D: 'debug', M: 'master' };
+  const SOURCE_LABELS = { ha: 'HA', user: 'CMD', slave: 'SLV', debug: 'DBG', master: 'MST' };
   let rxBuffer = '';
 
   const terminal = document.getElementById('terminal');
@@ -519,6 +530,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
   const filterCbs = {
     ha: document.getElementById('fHa'),
     user: document.getElementById('fUser'),
+    master: document.getElementById('fMaster'),
     slave: document.getElementById('fSlave'),
     debug: document.getElementById('fDebug')
   };

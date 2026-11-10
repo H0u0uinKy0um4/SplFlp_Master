@@ -7,9 +7,6 @@
 #include "WString.h"
 
 
-
-
-
 Module::Module(const String& s) {
     int start = s.indexOf(':');
 
@@ -40,34 +37,8 @@ Module::Module(const String& s) {
     }
 
     online = true;
-    lastSeen = millis();
 }
 
 
 Module::Module() {
-}
-
-void Module::changeHomeOffset(int offset)
-{
-    homeOffset = offset;
-    String messege = "m"+String(id)+"o"+String(homeOffset);
-    rs485Send(messege);
-
-}
-void Module::changeStepsPerRev(int steps)
-{
-    stepsPerRev = steps;
-    String messege = "m"+String(id)+"t"+String(stepsPerRev);
-    rs485Send(messege);
-}
-
-void Module::addMapPos(int index, int pos)
-{
-    String messege = "m"+String(id)+"w"+String(index)+":"+String(pos);
-    rs485Send(messege);
-}
-void Module::changeFlap(int index, char flap)
-{
-    String messege = "m"+String(id)+"f"+String(index)+":"+flap;
-    rs485Send(messege);
 }

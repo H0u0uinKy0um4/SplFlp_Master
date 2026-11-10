@@ -1,8 +1,7 @@
 #pragma once
 
-void connectWifi();
+void beginWifi();
 void setupMqtt();
 void handleMqtt();
-void publishMqttResponse(const char* message);
 void publishDiscovery();
 void publishStatus();

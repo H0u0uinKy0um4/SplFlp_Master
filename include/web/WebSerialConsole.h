@@ -26,9 +26,10 @@ public:
         DEBUG = 0,
         HA    = 1,
         USER  = 2,
-        SLAVE = 3
+        SLAVE = 3,
+        MASTER = 4
     };
-    static constexpr uint8_t SOURCE_COUNT = 4;
+    static constexpr uint8_t SOURCE_COUNT = 5;
 
     // Temporarily tag everything written through Serial with a source.
     class Scope {
@@ -185,10 +186,11 @@ public:
 private:
     static char tagFor(Source source) {
         switch (source) {
-            case Source::HA:    return 'H';
-            case Source::USER:  return 'U';
-            case Source::SLAVE: return 'S';
-            default:            return 'D';
+            case Source::HA:     return 'H';
+            case Source::USER:   return 'U';
+            case Source::SLAVE:  return 'S';
+            case Source::MASTER: return 'M';
+            default:             return 'D';
         }
     }
 
@@ -221,7 +223,8 @@ private:
 
     // Wire format: 0x01 <tag> <line text> '\n'
     //   H = Home Assistant request, U = user command,
-    //   S = slave response, D = debug output.
+    //   S = slave response, M = master transmission (outgoing RS485
+    //   command), D = debug output.
     void broadcastTagged(Source source, const char* text, size_t len) {
         char out[LINE_BUF_SIZE + 3];
         out[0] = '\x01';
