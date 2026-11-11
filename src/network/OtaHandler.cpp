@@ -2,7 +2,7 @@
 #include "network/OtaHandler.h"
 #include "secrets.h"
 #include <ArduinoOTA.h>
-#include "web/WebSerialConsole.h"
+#include <WebSerialConsole.h>
 
 
 const char* ota_password = OTA_PASSWORD;

@@ -4,7 +4,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include "secrets.h"
-#include "web/WebSerialConsole.h"
+#include "Sources.h"
 #include "Display.h"
 #include "RS485.h"
 #include "Version.h"
@@ -216,7 +216,7 @@ bool ensureMqtt() {
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // Everything logged from an MQTT callback is an HA-originated request.
-  WebSerialConsole::Scope scope(WebSerial, WebSerialConsole::Source::HA);
+  WebSerialConsole::Scope scope(WebSerial, sourceHa);
 
   String incomingTopic = String(topic);
 

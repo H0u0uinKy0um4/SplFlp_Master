@@ -2,7 +2,7 @@
 #include "RS485.h"
 #include "Config.h"
 #include "Version.h"
-#include "web/WebSerialConsole.h"
+#include "Sources.h"
 #include <cstring>
 
 SlaveFlasher slaveFlasher;
@@ -112,7 +112,7 @@ const char* nackName(uint8_t code) {
 }
 
 void otaLog(const String& line) {
-    WebSerialConsole::Scope scope(WebSerial, WebSerialConsole::Source::MASTER);
+    WebSerialConsole::Scope scope(WebSerial, sourceMaster);
     Serial.println(line);
 }
 

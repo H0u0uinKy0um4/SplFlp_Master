@@ -3,7 +3,7 @@
 #include "WString.h"
 #include <Arduino.h>
 #include <cstdint>
-#include "web/WebSerialConsole.h"
+#include <WebSerialConsole.h>
 #include "Config.h"
 
 Module* Display::getModule(uint16_t id) {

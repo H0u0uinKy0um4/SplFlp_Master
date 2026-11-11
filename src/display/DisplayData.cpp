@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <EEPROM.h>
-#include "web/WebSerialConsole.h"
+#include <WebSerialConsole.h>
 #include "Config.h"
 
 

@@ -32,6 +32,36 @@ Configuration lives in `include/secrets.h` (WiFi + MQTT) and
 `include/Config.h` (pins, timeouts, scan slice). The default MQTT prefix is
 `splitflap`.
 
+## Web console
+
+The browser console is not part of this repository any more: it is the
+`WebSerialConsole` library, which serves the page, bridges the USB serial port
+to the WebSocket and keeps the scrollback.
+
+```ini
+lib_deps =
+    https://github.com/H0u0uinKy0um4/WebSerialConsole.git#v1.1.1
+```
+
+The console is reachable at **http://splitflap.local/** (mDNS) and at the IP
+the master prints on the USB console.
+
+The library only knows two output categories (`DEBUG` and `USER`); the master
+registers its own in `src/Sources.cpp`, so the web UI can label and colour them:
+
+| Category | Tag | Badge | Colour | Used for |
+| --- | --- | --- | --- | --- |
+| `ha` | `H` | HA | `#c084fc` | Home Assistant (MQTT) requests |
+| `master` | `M` | MST | `#fbbf24` | Commands the master puts on the bus |
+| `slave` | `S` | SLV | `#34d399` | Answers the slave modules send back |
+
+```cpp
+{
+  WebSerialConsole::Scope scope(WebSerial, sourceMaster);
+  Serial.println("m1s");     // shown as an MST line in the browser
+}
+```
+
 ## MQTT contract
 
 ### Commands (Home Assistant -> master)
@@ -137,6 +167,7 @@ with the bootloader framing or boot policy. See the slave's
 | `src/RS485.cpp` | Half-duplex line send/receive |
 | `src/network/WifiMqttHandler.cpp` | MQTT commands, status payload, discovery |
 | `src/ota/SlaveFlasher.cpp` | Image assembly and the blocking RS485 flash session |
-| `src/web/` | Web serial console and status page |
+| `src/Sources.cpp` | Output categories (HA, bus master, bus slave) of the web console |
 | `include/Config.h` | Pins, bus timing, scan limits |
+| `include/Sources.h` | Handles of the registered output categories |
 | `include/Version.h` | Compatibility/release constants |

@@ -1,16 +1,20 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#include "web/WebSerialConsole.h"
+#include <WebSerialConsole.h>
+#include "Sources.h"
 #include "network/OtaHandler.h"
 #include "network/WifiMqttHandler.h"
-#include "web/WebServerHandler.h"
 #include "RS485.h"
 #include "Display.h"
 
 void setup() {
   Serial.begin(115200);
   delay(500);
+
+  // Register the output categories before anything is logged, so the web
+  // console can label and colour them.
+  registerSources();
 
   setupRS485();
   // Non-blocking WiFi start: if the router is not up yet (e.g. after a power
@@ -19,13 +23,15 @@ void setup() {
   beginWifi();
   setupMqtt();
   setupOTA();
-  setupWebServer();
+  // Start the web console (HTTP + WebSocket). WiFi is owned by beginWifi().
+  WebSerial.beginWeb();
   splitflap.begin();
 }
 
 void loop() {
   ArduinoOTA.handle();
-  handleWebServer();
+  // Serves the console page, pumps the WebSocket and the serial bridge.
+  WebSerial.loop();
   handleMqtt();
 
 // Send commands from Serial to RS485
@@ -37,7 +43,7 @@ void loop() {
 
   // Read Attiny response
   if (Serial1.available()) {
-    WebSerialConsole::Scope scope(WebSerial, WebSerialConsole::Source::SLAVE);
+    WebSerialConsole::Scope scope(WebSerial, sourceSlave);
     while (Serial1.available()) {
       char c = Serial1.read();
       Serial.write(c);

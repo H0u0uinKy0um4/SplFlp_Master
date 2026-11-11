@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include "RS485.h"
 #include "Config.h"
-#include "web/WebSerialConsole.h"
+#include "Sources.h"
 
 // Non-blocking serial command buffer
 static String serialCmdBuffer = "";
@@ -40,7 +40,7 @@ void rs485Send(const String &msg) {
   // direction readable on the raw USB console, where source tags do not
   // exist. Print before DE goes high: buffered UART output, no bus delay.
   {
-    WebSerialConsole::Scope scope(WebSerial, WebSerialConsole::Source::MASTER);
+    WebSerialConsole::Scope scope(WebSerial, sourceMaster);
     Serial.print("→ ");
     Serial.print(msg);
     if (!msg.endsWith("\n")) Serial.print("\n");
@@ -86,7 +86,7 @@ void rs485Send(const String &msg) {
 String rs485read(bool trim) {
   // Echo every received byte live to the console as a SLAVE line, so the
   // response is visible even if the line never terminates or never parses.
-  WebSerialConsole::Scope scope(WebSerial, WebSerialConsole::Source::SLAVE);
+  WebSerialConsole::Scope scope(WebSerial, sourceSlave);
 
   int availableBytes = Serial1.available();
 
