@@ -320,7 +320,7 @@ bool Display::sendQueryAndWait(uint16_t id, uint16_t timeoutMs, Module &mod)
     const char previousFlap = mod.flap;
     const String previousFlapList = mod.flapList;
     const String previousFwVersion = mod.fwVersion;
-    const uint8_t previousFwCompat = mod.fwCompat;
+    const uint8_t previousFwBusCompat = mod.fwBusCompat;
     const uint32_t previousPos = mod.currentPos;
     const bool previousPositionKnown = mod.positionKnown;
 
@@ -369,7 +369,7 @@ bool Display::sendQueryAndWait(uint16_t id, uint16_t timeoutMs, Module &mod)
 
     delay(BUS_RELEASE_MS);
 
-    // State query: m<id>s:<pos>:<busy>:<position_known>[:<compat>:<fw_version>]
+    // State query: m<id>s:<pos>:<busy>:<position_known>[:<bus_compat>:<fw_version>]
     String stateQuery;
     stateQuery += 'm';
     stateQuery += String(id);
@@ -394,13 +394,14 @@ bool Display::sendQueryAndWait(uint16_t id, uint16_t timeoutMs, Module &mod)
                 // Older slaves stop after pos; treat that as position known.
                 mod.positionKnown =
                     p3 > p2 ? resp.substring(p3 + 1, p4 > p3 ? p4 : resp.length()).toInt() != 0 : true;
-                // Newer slaves append "<compat>:<fw_version>". The compat
-                // field is explicit so the master never has to parse it out
-                // of the version string.
+                // Newer slaves append "<bus_compat>:<fw_version>". The
+                // bus compat field is explicit so the master never has to
+                // parse it out of the version string. The MQTT generation is
+                // a separate axis and never appears on this bus.
                 if (p4 > p3) {
                     String compat = resp.substring(p4 + 1, p5 > p4 ? p5 : resp.length());
                     compat.trim();
-                    if (compat.length() > 0) mod.fwCompat = (uint8_t)compat.toInt();
+                    if (compat.length() > 0) mod.fwBusCompat = (uint8_t)compat.toInt();
                 }
                 if (p5 > p4) {
                     String version = resp.substring(p5 + 1);
@@ -408,7 +409,7 @@ bool Display::sendQueryAndWait(uint16_t id, uint16_t timeoutMs, Module &mod)
                     if (version.length() > 0) mod.fwVersion = version;
                 }
                 if (mod.fwVersion.length() == 0) mod.fwVersion = previousFwVersion;
-                if (mod.fwCompat == 0) mod.fwCompat = previousFwCompat;
+                if (mod.fwBusCompat == 0) mod.fwBusCompat = previousFwBusCompat;
                 gotState = true;
             }
             break;
@@ -419,7 +420,7 @@ bool Display::sendQueryAndWait(uint16_t id, uint16_t timeoutMs, Module &mod)
         mod.currentPos = previousPos;
         mod.positionKnown = previousPositionKnown;
         mod.fwVersion = previousFwVersion;
-        mod.fwCompat = previousFwCompat;
+        mod.fwBusCompat = previousFwBusCompat;
     } else {
         // The position is trustworthy: derive the module's real flap from it
         // instead of reporting the last requested character.
