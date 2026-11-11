@@ -26,6 +26,10 @@ struct Module {
     // (64-character drum). Home Assistant displays them on the module entity.
     String flapList;
     String positionMap;
+    // Application firmware version/compat reported in m<id>s. Empty/0 for
+    // slaves that predate version tracking.
+    String fwVersion;
+    uint8_t fwCompat = 0;
 
     bool online = false;
 

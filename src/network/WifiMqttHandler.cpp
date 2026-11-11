@@ -7,6 +7,9 @@
 #include "web/WebSerialConsole.h"
 #include "Display.h"
 #include "RS485.h"
+#include "Version.h"
+#include "ota/SlaveFlasher.h"
+#include <cstring>
 
 
 const char *wifi_ssid = WIFI_SSID;
@@ -24,6 +27,10 @@ String sync_topic    = String(topic_prefix) + "/command/sync";
 String scan_topic    = String(topic_prefix) + "/command/scan";
 String update_topic  = String(topic_prefix) + "/command/update";
 String calibrate_topic = String(topic_prefix) + "/command/calibrate";
+// Slave-module OTA: image collection and flash session control. See
+// include/ota/SlaveFlasher.h for the message schema and PROTOCOL.md in the
+// slave repository for the wire protocol.
+String firmware_topic = String(topic_prefix) + "/command/firmware";
 
 WiFiClient wifiClient;
 PubSubClient client(wifiClient);
@@ -191,6 +198,7 @@ bool ensureMqtt() {
     client.subscribe(scan_topic.c_str());
     client.subscribe(update_topic.c_str());
     client.subscribe(calibrate_topic.c_str());
+    client.subscribe(firmware_topic.c_str());
 
     // Publish discovery configuration first, then the initial online status
     // (publishStatus also stamps the heartbeat timer).
@@ -219,6 +227,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
     // DISPLAY COMMAND
   if (incomingTopic == display_topic) {
+
+      // A flash session owns the bus for its whole duration; interleaving
+      // display lines with firmware frames would corrupt the session.
+      if (slaveFlasher.active()) {
+          Serial.println("[OTA] flash session in progress, ignoring display command");
+          return;
+      }
 
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, message);
@@ -279,6 +294,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     // SCAN COMMAND
     else if (incomingTopic == scan_topic) {
 
+        if (slaveFlasher.active()) {
+            Serial.println("[OTA] flash session in progress, ignoring scan request");
+            return;
+        }
+
         Serial.println("Bus scan requested from Home Assistant!");
 
         // Incremental scan: the loop keeps running (MQTT, web console, OTA)
@@ -292,6 +312,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
     // UPDATE COMMAND
     else if (incomingTopic == update_topic) {
+
+        if (slaveFlasher.active()) {
+            Serial.println("[OTA] flash session in progress, ignoring refresh request");
+            return;
+        }
 
         Serial.println("Module update requested from Home Assistant!");
 
@@ -310,6 +335,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
     // CALIBRATE COMMAND
     else if (incomingTopic == calibrate_topic) {
+        if (slaveFlasher.active()) {
+            Serial.println("[OTA] flash session in progress, ignoring calibrate command");
+            return;
+        }
+
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, message);
         if (error) {
@@ -433,6 +463,103 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             publishStatus();
         }
     }
+
+    // FIRMWARE COMMAND (slave-module OTA)
+    else if (incomingTopic == firmware_topic) {
+
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, message);
+        if (error) {
+            Serial.println("Failed to parse firmware command");
+            return;
+        }
+        const char* action = doc["action"] | "";
+
+        if (strcmp(action, "begin") == 0) {
+            const int module = doc["module"] | doc["module_id"] | -1;
+            if (module <= 0 || module > 255 ||
+                !slaveFlasher.beginImage(static_cast<uint8_t>(module))) {
+                Serial.println("[OTA] begin refused (invalid module id or a session is active)");
+            }
+            publishStatus();
+        } else if (strcmp(action, "chunk") == 0) {
+            const char* data = doc["data"] | "";
+            if (!slaveFlasher.appendChunk(data)) {
+                Serial.println("[OTA] chunk refused (no collection in progress or invalid data)");
+                publishStatus();
+            } else if ((slaveFlasher.imageSize() & 1023) == 0) {
+                // Milestone publishes (every full kilobyte) keep the
+                // collection progress visible without a publish per chunk.
+                publishStatus();
+            }
+        } else if (strcmp(action, "flash") == 0) {
+            if (slaveFlasher.active()) {
+                Serial.println("[OTA] a session is already running");
+                return;
+            }
+            if (!slaveFlasher.imageReady()) {
+                Serial.println("[OTA] flash requested without a complete image");
+                publishStatus();
+                return;
+            }
+            if (splitflap.isScanning()) {
+                Serial.println("[OTA] a bus scan is in progress, refusing to flash");
+                publishStatus();
+                return;
+            }
+
+            Serial.printf("[OTA] flash session starting for module %u\n",
+                          slaveFlasher.targetModule());
+
+            // Blocking for ~20-25 s: display/scan/update/calibrate commands
+            // are refused above while the session owns the bus, and MQTT
+            // stays alive through the flasher's pump hook.
+            const bool ok = slaveFlasher.runSession();
+
+            if (ok) {
+                // The module booted into the new application; it may
+                // auto-home first (a blocking move), so mark its busy
+                // window before touching the bus again. Then re-apply its
+                // last requested character: a move to the character
+                // already shown is a no-op on the slave, so nothing
+                // twitches. refreshSettledMoves() re-scans the module
+                // once the window expires.
+                const uint8_t flashedId = slaveFlasher.targetModule();
+                char lastFlap = '\0';
+                for (const auto& mod : splitflap.getModules()) {
+                    if (mod.id == flashedId) {
+                        lastFlap = mod.flap;
+                        break;
+                    }
+                }
+                splitflap.markMovingHome(flashedId);
+                if (lastFlap != '\0') {
+                    splitflap.setModuleChar(flashedId, lastFlap);
+                }
+            }
+
+            publishStatus();
+        } else if (strcmp(action, "cancel") == 0) {
+            // Mid-session this sets the abort flag (seen between pages);
+            // otherwise it discards a collected image.
+            slaveFlasher.cancel();
+            publishStatus();
+        } else if (strcmp(action, "reset") == 0) {
+            const int module = doc["module"] | doc["module_id"] | -1;
+            if (module <= 0 || module > 255) {
+                Serial.println("[OTA] invalid module id in reset command");
+            } else if (slaveFlasher.active() || slaveFlasher.collecting()) {
+                Serial.println("[OTA] reset refused (session active or image being collected)");
+            } else {
+                // Boots a module stuck in the bootloader back into its
+                // intact application.
+                slaveFlasher.resetModule(static_cast<uint8_t>(module));
+            }
+            publishStatus();
+        } else {
+            Serial.println("[OTA] unknown firmware action");
+        }
+    }
 }
 
 // Setup MQTT Server and Callback
@@ -442,6 +569,14 @@ void setupMqtt() {
   client.setBufferSize(2048);
   client.setServer(mqtt_host, mqtt_port);
   client.setCallback(mqttCallback);
+  // The flash session blocks inside the MQTT callback for ~20-25 s. The
+  // pump keeps the broker connection alive and delivers a mid-session
+  // "cancel": client.loop() is safe to re-enter from a callback here — the
+  // callback copies its payload before dispatching and all subscriptions
+  // are QoS 0 (the QoS 1 PUBACK-after-callback path is never taken). The
+  // notifier publishes progress on the status topic.
+  slaveFlasher.setPump([]() { client.loop(); });
+  slaveFlasher.setNotifier([]() { publishStatus(); });
   Serial.println("setUp Mqtt");
 }
 
@@ -451,6 +586,13 @@ void publishStatus() {
 
     doc["state"] = "online";
     doc["text"] = current_text;
+
+    // Cross-repo version contract (see the slave repository's
+    // docs/VERSIONING.md). The first number of "version" is the shared
+    // compatibility generation; "compat" repeats it explicitly so Home
+    // Assistant never has to parse the string.
+    doc["version"] = MASTER_VERSION;
+    doc["compat"] = MASTER_COMPAT;
 
     // Incremental scan progress. The integration ignores these when no scan
     // is running (scan_progress is only published during one).
@@ -494,6 +636,17 @@ void publishStatus() {
         if (mod.positionMap.length() > 0) {
             module["map_of_positions"] = mod.positionMap;
         }
+        // Application version the module reports in m<id>s; compare it with
+        // the build you just flashed to prove the update took. The compat
+        // field is only present when the module reports one, so old firmware
+        // is "unknown", not "incompatible".
+        if (mod.fwVersion.length() > 0) {
+            module["fw_version"] = mod.fwVersion;
+        }
+        if (mod.fwCompat > 0) {
+            module["fw_compat"] = mod.fwCompat;
+            module["fw_compatible"] = mod.fwCompat == SLAVE_COMPAT;
+        }
 
         if (mod.flap != '\0') {
             char flap[2] = { mod.flap, '\0' };
@@ -504,6 +657,28 @@ void publishStatus() {
     }
 
     doc["modules_count"] = modules.size();
+
+    // OTA flash state for the panel: "idle" unless an image collection or a
+    // flash session is in progress — or has just finished, so the outcome
+    // stays readable until the next "begin".
+    JsonObject ota = doc["ota"].to<JsonObject>();
+    ota["state"] = slaveFlasher.stateString();
+    if (slaveFlasher.targetModule() != 0) {
+        ota["module"] = slaveFlasher.targetModule();
+    }
+    if (slaveFlasher.bootloaderVersion() != 0) {
+        // OTA protocol generation the module answered with; compare it with
+        // OTA_PROTOCOL_VERSION when diagnosing a refused session.
+        ota["bootloader_version"] = slaveFlasher.bootloaderVersion();
+    }
+    if (slaveFlasher.collecting()) {
+        ota["received"] = slaveFlasher.imageSize();
+    }
+    const int otaProgress = slaveFlasher.progress();
+    if (otaProgress >= 0) ota["progress"] = otaProgress;
+    if (slaveFlasher.error()[0] != '\0') {
+        ota["error"] = slaveFlasher.error();
+    }
 
     String payload;
     serializeJson(doc, payload);
