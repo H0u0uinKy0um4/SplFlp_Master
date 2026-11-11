@@ -321,6 +321,17 @@ bool SlaveFlasher::resetModule(uint8_t moduleId) {
 bool SlaveFlasher::enterBootloader() {
     setState(State::Entering);
     notify();
+    // If the module is already in the bootloader (flag armed from a
+    // previous attempt), skip the ASCII entry command and proceed.
+    {
+        Response r;
+        if (exchange(kCmdPing, nullptr, 0, r) && r.cmd == kRespAck &&
+            r.len == 3 && r.payload[1] == moduleId_) {
+            otaLog("OTA: module " + String((int)moduleId_) + " already in bootloader");
+            pumpDelay(ENTER_BOOT_DELAY_MS);
+            return true;
+        }
+    }
     otaLog("OTA: asking module " + String((int)moduleId_) + " to enter the bootloader");
     rs485Send("m" + String((int)moduleId_) + "b");
 
@@ -568,6 +579,22 @@ void SlaveFlasher::sendFrame(uint8_t cmd, const uint8_t* payload, uint8_t len) {
     delayMicroseconds(100);          // driver settle, as in rs485Send()
     Serial1.write(wire, n);          // blocks until all bytes are queued
     Serial1.flush();                // wait for the last stop bit
+    // Drain our own half-duplex echo so recvResponse() only sees the
+    // slave's reply.  Without this the echo (which starts with the same
+    // 0xAA sync) can be mis-parsed and the real response missed.
+    {
+        unsigned long echoStart = millis();
+        size_t dropped = 0;
+        while (dropped < n && (millis() - echoStart) < 5) {
+            if (Serial1.available()) {
+                Serial1.read();
+                dropped++;
+            } else {
+                yield();
+            }
+        }
+    }
+    delayMicroseconds(100);
     digitalWrite(RS485_DE, LOW);
 }
 
