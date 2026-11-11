@@ -40,7 +40,7 @@ to the WebSocket and keeps the scrollback.
 
 ```ini
 lib_deps =
-    https://github.com/H0u0uinKy0um4/WebSerialConsole.git#v1.1.1
+    https://github.com/H0u0uinKy0um4/WebSerialConsole.git#v1.1.2
 ```
 
 The console is reachable at **http://splitflap.local/** (mDNS) and at the IP
