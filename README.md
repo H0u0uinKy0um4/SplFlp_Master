@@ -51,7 +51,9 @@ Configuration lives in `include/secrets.h` (WiFi + MQTT) and
 {
   "state": "online",
   "text": "HELLO",
-  "version": "1.0.0",
+  "version": "1.1.0.0",
+  "bus_compat": 1,
+  "mqtt_compat": 1,
   "compat": 1,
   "scanning": false,
   "modules_count": 3,
@@ -70,7 +72,9 @@ Configuration lives in `include/secrets.h` (WiFi + MQTT) and
       "auto_homing": true,
       "flap_list": " ABC...",
       "map_of_positions": "0=2832,1=2896,...",
-      "fw_version": "1.0.0",
+      "fw_version": "1.0.1",
+      "fw_bus_compat": 1,
+      "fw_bus_compatible": true,
       "fw_compat": 1,
       "fw_compatible": true
     }
@@ -81,9 +85,11 @@ Configuration lives in `include/secrets.h` (WiFi + MQTT) and
 }
 ```
 
-`version`/`compat` are the master's own version contract. Per-module
-`fw_version`/`fw_compat` come from the slave's `m<id>s` reply;
-`fw_compatible` is omitted when the module does not report a version. During a
+`version`/`bus_compat`/`mqtt_compat` are the master's own version contract;
+`compat` remains an alias for `mqtt_compat` for older Home Assistant builds.
+Per-module `fw_version`/`fw_bus_compat` come from the slave's `m<id>s` reply;
+`fw_bus_compatible` is omitted when the module does not report a version, and
+`fw_compat`/`fw_compatible` remain aliases for the bus values. During a
 flash session `ota` carries `state`, `module`, `progress`, `error` and the
 module's `bootloader_version`.
 
@@ -108,15 +114,19 @@ intact application. Recovery details are in the slave `PROTOCOL.md`.
 `include/Version.h` is the master's source of truth:
 
 ```c
-#define MASTER_COMPAT 1        // shared with slave + Home Assistant
-#define MASTER_RELEASE "0.0"   // per-repo release
-#define MASTER_VERSION "1.0.0" // composed
-#define OTA_PROTOCOL_VERSION 1 // bootloader framing generation
+#define MASTER_BUS_COMPAT 1         // shared with the slave (slave <-> master)
+#define MASTER_MQTT_COMPAT 1        // shared with Home Assistant (MQTT JSON)
+#define MASTER_RELEASE "0.0"        // per-repo release
+#define MASTER_VERSION "1.1.0.0"    // <bus>.<mqtt>.<release>
+#define OTA_PROTOCOL_VERSION 1      // bootloader framing generation
 ```
 
-A compatibility mismatch is visible, not fatal: display traffic keeps working,
-HA warns, and only the OTA path is strict because it writes irreversible
-state. See the slave's `docs/VERSIONING.md` for the bump procedure.
+The master carries both compatibility domains because it bridges them. A
+compatibility mismatch is visible, not fatal: display traffic keeps working,
+HA warns, and only the OTA path is strict because it writes irreversible state.
+The OTA protocol generation is a third, independent number; it changes only
+with the bootloader framing or boot policy. See the slave's
+`docs/VERSIONING.md` for the bump procedure.
 
 ## Source map
 

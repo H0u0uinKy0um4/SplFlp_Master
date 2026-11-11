@@ -588,11 +588,16 @@ void publishStatus() {
     doc["text"] = current_text;
 
     // Cross-repo version contract (see the slave repository's
-    // docs/VERSIONING.md). The first number of "version" is the shared
-    // compatibility generation; "compat" repeats it explicitly so Home
-    // Assistant never has to parse the string.
+    // docs/VERSIONING.md). There are two independent compatibility domains:
+    // "bus_compat" covers the slave <-> master RS485/OTA contract and
+    // "mqtt_compat" covers this MQTT JSON schema (master <-> Home Assistant).
+    // Both are published explicitly so Home Assistant never has to parse the
+    // version string. "compat" remains an alias for the MQTT generation for
+    // older Home Assistant builds.
     doc["version"] = MASTER_VERSION;
-    doc["compat"] = MASTER_COMPAT;
+    doc["bus_compat"] = MASTER_BUS_COMPAT;
+    doc["mqtt_compat"] = MASTER_MQTT_COMPAT;
+    doc["compat"] = MASTER_MQTT_COMPAT;
 
     // Incremental scan progress. The integration ignores these when no scan
     // is running (scan_progress is only published during one).
@@ -637,15 +642,18 @@ void publishStatus() {
             module["map_of_positions"] = mod.positionMap;
         }
         // Application version the module reports in m<id>s; compare it with
-        // the build you just flashed to prove the update took. The compat
+        // the build you just flashed to prove the update took. The bus compat
         // field is only present when the module reports one, so old firmware
-        // is "unknown", not "incompatible".
+        // is "unknown", not "incompatible". "fw_compat"/"fw_compatible" are
+        // aliases kept for older Home Assistant builds.
         if (mod.fwVersion.length() > 0) {
             module["fw_version"] = mod.fwVersion;
         }
-        if (mod.fwCompat > 0) {
-            module["fw_compat"] = mod.fwCompat;
-            module["fw_compatible"] = mod.fwCompat == SLAVE_COMPAT;
+        if (mod.fwBusCompat > 0) {
+            module["fw_bus_compat"] = mod.fwBusCompat;
+            module["fw_bus_compatible"] = mod.fwBusCompat == SLAVE_BUS_COMPAT;
+            module["fw_compat"] = mod.fwBusCompat;
+            module["fw_compatible"] = mod.fwBusCompat == SLAVE_BUS_COMPAT;
         }
 
         if (mod.flap != '\0') {
