@@ -1,6 +1,7 @@
 #include "ota/SlaveFlasher.h"
 #include "RS485.h"
 #include "Config.h"
+#include "Version.h"
 #include "web/WebSerialConsole.h"
 #include <cstring>
 
@@ -27,6 +28,10 @@ constexpr uint8_t kEsc     = 0x5C;
 constexpr uint8_t kEscEsc  = 0x00;   // 0x5C 0x00 encodes 0x5C
 constexpr uint8_t kEscM    = 0x01;   // 0x5C 0x01 encodes 0x6D
 constexpr uint8_t kForbidden = 0x6D;  // 'm': never raw inside a frame
+
+// Bootloader PING payload[0]. A mismatch aborts before START_UPDATE, so an
+// incompatible bootloader is never written to.
+constexpr uint8_t kOtaProtocolVersion = OTA_PROTOCOL_VERSION;
 
 // Largest response payload (PING info: version, module id, staying).
 constexpr uint8_t kRespMaxPayload = 3;
@@ -222,6 +227,7 @@ bool SlaveFlasher::runSession() {
     abort_ = false;
     pageAttempted_ = false;
     pagesDone_ = 0;
+    bootloaderVersion_ = 0;
     totalPages_ = (uint16_t)((size_ + PAGE_SIZE - 1) / PAGE_SIZE);
     imageCrc_ = 0xFFFFFFFFUL;
     for (uint16_t i = 0; i < size_; i++) imageCrc_ = crc32Byte(imageCrc_, image_[i]);
@@ -353,6 +359,13 @@ bool SlaveFlasher::waitForBootloader(bool appAcked) {
         Response r;
         if (exchange(kCmdPing, nullptr, 0, r) && r.cmd == kRespAck && r.len == 3 &&
             r.payload[1] == moduleId_) {
+            if (r.payload[0] != kOtaProtocolVersion) {
+                fail("module " + String((int)moduleId_) +
+                     " bootloader protocol " + String((int)r.payload[0]) +
+                     ", expected " + String((int)kOtaProtocolVersion));
+                return false;
+            }
+            bootloaderVersion_ = r.payload[0];
             // staying == 1: the boot flag is armed (or the application
             // looks erased) — full update mode. staying == 0: the
             // bootloader is in its 500 ms boot window with the flag clear;
@@ -360,7 +373,8 @@ bool SlaveFlasher::waitForBootloader(bool appAcked) {
             // The PING just refreshed that window, keeping the module in
             // the bootloader until START_UPDATE arrives milliseconds
             // later.
-            otaLog("OTA: bootloader ready (version " + String((int)r.payload[0]) +
+            otaLog("OTA: bootloader ready (protocol " +
+                   String((int)r.payload[0]) +
                    ", staying=" + String((int)r.payload[2]) + ")");
             return true;
         }

@@ -7,6 +7,7 @@
 #include "web/WebSerialConsole.h"
 #include "Display.h"
 #include "RS485.h"
+#include "Version.h"
 #include "ota/SlaveFlasher.h"
 #include <cstring>
 
@@ -586,6 +587,13 @@ void publishStatus() {
     doc["state"] = "online";
     doc["text"] = current_text;
 
+    // Cross-repo version contract (see the slave repository's
+    // docs/VERSIONING.md). The first number of "version" is the shared
+    // compatibility generation; "compat" repeats it explicitly so Home
+    // Assistant never has to parse the string.
+    doc["version"] = MASTER_VERSION;
+    doc["compat"] = MASTER_COMPAT;
+
     // Incremental scan progress. The integration ignores these when no scan
     // is running (scan_progress is only published during one).
     doc["scanning"] = splitflap.isScanning();
@@ -628,6 +636,17 @@ void publishStatus() {
         if (mod.positionMap.length() > 0) {
             module["map_of_positions"] = mod.positionMap;
         }
+        // Application version the module reports in m<id>s; compare it with
+        // the build you just flashed to prove the update took. The compat
+        // field is only present when the module reports one, so old firmware
+        // is "unknown", not "incompatible".
+        if (mod.fwVersion.length() > 0) {
+            module["fw_version"] = mod.fwVersion;
+        }
+        if (mod.fwCompat > 0) {
+            module["fw_compat"] = mod.fwCompat;
+            module["fw_compatible"] = mod.fwCompat == SLAVE_COMPAT;
+        }
 
         if (mod.flap != '\0') {
             char flap[2] = { mod.flap, '\0' };
@@ -646,6 +665,11 @@ void publishStatus() {
     ota["state"] = slaveFlasher.stateString();
     if (slaveFlasher.targetModule() != 0) {
         ota["module"] = slaveFlasher.targetModule();
+    }
+    if (slaveFlasher.bootloaderVersion() != 0) {
+        // OTA protocol generation the module answered with; compare it with
+        // OTA_PROTOCOL_VERSION when diagnosing a refused session.
+        ota["bootloader_version"] = slaveFlasher.bootloaderVersion();
     }
     if (slaveFlasher.collecting()) {
         ota["received"] = slaveFlasher.imageSize();

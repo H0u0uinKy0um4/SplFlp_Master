@@ -319,6 +319,8 @@ bool Display::sendQueryAndWait(uint16_t id, uint16_t timeoutMs, Module &mod)
     // cannot wipe the cached drum or position.
     const char previousFlap = mod.flap;
     const String previousFlapList = mod.flapList;
+    const String previousFwVersion = mod.fwVersion;
+    const uint8_t previousFwCompat = mod.fwCompat;
     const uint32_t previousPos = mod.currentPos;
     const bool previousPositionKnown = mod.positionKnown;
 
@@ -367,7 +369,7 @@ bool Display::sendQueryAndWait(uint16_t id, uint16_t timeoutMs, Module &mod)
 
     delay(BUS_RELEASE_MS);
 
-    // State query: m<id>s:<pos>:<busy>:<position_known>
+    // State query: m<id>s:<pos>:<busy>:<position_known>[:<compat>:<fw_version>]
     String stateQuery;
     stateQuery += 'm';
     stateQuery += String(id);
@@ -385,11 +387,28 @@ bool Display::sendQueryAndWait(uint16_t id, uint16_t timeoutMs, Module &mod)
             int p1 = resp.indexOf(':');
             int p2 = p1 >= 0 ? resp.indexOf(':', p1 + 1) : -1;
             int p3 = p2 >= 0 ? resp.indexOf(':', p2 + 1) : -1;
+            int p4 = p3 >= 0 ? resp.indexOf(':', p3 + 1) : -1;
+            int p5 = p4 >= 0 ? resp.indexOf(':', p4 + 1) : -1;
             if (p1 > 0 && p2 > p1) {
                 mod.currentPos = (uint32_t)resp.substring(p1 + 1, p2).toInt();
                 // Older slaves stop after pos; treat that as position known.
                 mod.positionKnown =
-                    p3 > p2 ? resp.substring(p3 + 1).toInt() != 0 : true;
+                    p3 > p2 ? resp.substring(p3 + 1, p4 > p3 ? p4 : resp.length()).toInt() != 0 : true;
+                // Newer slaves append "<compat>:<fw_version>". The compat
+                // field is explicit so the master never has to parse it out
+                // of the version string.
+                if (p4 > p3) {
+                    String compat = resp.substring(p4 + 1, p5 > p4 ? p5 : resp.length());
+                    compat.trim();
+                    if (compat.length() > 0) mod.fwCompat = (uint8_t)compat.toInt();
+                }
+                if (p5 > p4) {
+                    String version = resp.substring(p5 + 1);
+                    version.trim();
+                    if (version.length() > 0) mod.fwVersion = version;
+                }
+                if (mod.fwVersion.length() == 0) mod.fwVersion = previousFwVersion;
+                if (mod.fwCompat == 0) mod.fwCompat = previousFwCompat;
                 gotState = true;
             }
             break;
@@ -399,6 +418,8 @@ bool Display::sendQueryAndWait(uint16_t id, uint16_t timeoutMs, Module &mod)
     if (!gotState) {
         mod.currentPos = previousPos;
         mod.positionKnown = previousPositionKnown;
+        mod.fwVersion = previousFwVersion;
+        mod.fwCompat = previousFwCompat;
     } else {
         // The position is trustworthy: derive the module's real flap from it
         // instead of reporting the last requested character.

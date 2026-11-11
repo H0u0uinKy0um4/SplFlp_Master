@@ -88,6 +88,9 @@ public:
     // ---- status reporting (publishStatus "ota" object) ----
     const char* stateString() const;
     uint8_t targetModule() const { return moduleId_; }
+    // OTA protocol generation the module's bootloader answered with during
+    // the current/last session; 0 before a bootloader PING succeeded.
+    uint8_t bootloaderVersion() const { return bootloaderVersion_; }
     // 0..100 while a session runs, 100 when done, -1 otherwise.
     int progress() const;
     const char* error() const { return error_.c_str(); }
@@ -151,6 +154,7 @@ private:
     uint32_t b64acc_ = 0;
     uint8_t b64bits_ = 0;
     uint8_t moduleId_ = 0;
+    uint8_t bootloaderVersion_ = 0;
     uint16_t size_ = 0;
     uint16_t pagesDone_ = 0;
     uint16_t totalPages_ = 0;
