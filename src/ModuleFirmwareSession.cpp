@@ -1,16 +1,14 @@
-#include "ota/SlaveFlasher.h"
-#include "RS485.h"
-#include "Config.h"
+#include "ota/ModuleFirmwareSession.h"
+#include "BusTrace.h"
+#include "Rs485Link.h"
 #include "Version.h"
-#include "Sources.h"
 #include <cstring>
 
-SlaveFlasher slaveFlasher;
+ModuleFirmwareSession firmwareSession;
 
-// Wire protocol constants, mirrored from the slave repository's
+// Wire protocol constants mirrored from the slave repository's
 // bootloader/src/protocol.h. The framing, CRCs and boot policy are specified
-// there (PROTOCOL.md, "OTA bootloader"); this file implements the master
-// side of exactly that protocol.
+// there (PROTOCOL.md, "OTA bootloader"); this file implements the master side.
 
 namespace {
 
@@ -23,65 +21,38 @@ constexpr uint8_t kCmdReset       = 0x05;
 constexpr uint8_t kRespAck  = 0x81;
 constexpr uint8_t kRespNack = 0x82;
 
-constexpr uint8_t kSync    = 0xAA;
-constexpr uint8_t kEsc     = 0x5C;
-constexpr uint8_t kEscEsc  = 0x00;   // 0x5C 0x00 encodes 0x5C
-constexpr uint8_t kEscM    = 0x01;   // 0x5C 0x01 encodes 0x6D
-constexpr uint8_t kForbidden = 0x6D;  // 'm': never raw inside a frame
+constexpr uint8_t kSync       = 0xAA;
+constexpr uint8_t kEsc        = 0x5C;
+constexpr uint8_t kEscEsc     = 0x00;   // 0x5C 0x00 encodes 0x5C
+constexpr uint8_t kEscM       = 0x01;   // 0x5C 0x01 encodes 0x6D
+constexpr uint8_t kForbidden  = 0x6D;   // 'm': never raw inside a frame
+constexpr uint8_t kOtaVersion = OTA_PROTOCOL_VERSION;
 
-// Bootloader PING payload[0]. A mismatch aborts before START_UPDATE, so an
-// incompatible bootloader is never written to.
-constexpr uint8_t kOtaProtocolVersion = OTA_PROTOCOL_VERSION;
-
-// Largest response payload (PING info: version, module id, staying).
-constexpr uint8_t kRespMaxPayload = 3;
-// Decoded response body: addr, cmd, len + payload + crc16.
+constexpr uint8_t kRespMaxPayload = 3;  // PING info: version, module id, staying
 constexpr uint8_t kRespBodyMax = 3 + kRespMaxPayload + 2;
+constexpr uint8_t kReqMaxPayload = 2 + ModuleFirmwareSession::PAGE_SIZE;  // 66
+constexpr size_t kWireMax = 1 + 2 * (3 + kReqMaxPayload + 2);             // 143
 
-// Largest request payload (WRITE_PAGE: page number u16 + 64 data bytes).
-constexpr uint8_t kReqMaxPayload = 2 + SlaveFlasher::PAGE_SIZE;   // 66
-
-// Worst wire size of a WRITE_PAGE frame: the sync byte plus twice the
-// logical body (every body byte may double through escaping). The body is
-// addr, cmd, len, the 66-byte payload and the CRC-16 — 71 bytes.
-constexpr size_t kWireMax = 1 + 2 * (3 + kReqMaxPayload + 2);   // 143
-
-// --- Session timing -------------------------------------------------------
-
-// Response timeout for one frame exchange. A page write (flash erase/write
-// plus the reply) takes ~10 ms on the slave; 250 ms leaves a wide margin.
+// One frame exchange. A page write (erase/write plus reply) takes ~10 ms;
+// FINISH computes a CRC-32 over the whole application region first.
 constexpr unsigned long RESPONSE_TIMEOUT_MS = 250;
-// FINISH makes the slave compute a CRC-32 over the whole application region
-// (~70 ms at 20 MHz) before it answers.
 constexpr unsigned long FINISH_TIMEOUT_MS = 500;
-// The application delays 100 ms after acking m<id>b and then resets; the
-// bootloader comes up within another ~100 ms.
 constexpr unsigned long ENTER_BOOT_DELAY_MS = 400;
-// Total budget for reaching the bootloader. A module finishing a blocking
-// move (worst case ~5 s) is deaf until it lands, so the entry command must
-// be retried well past one move window.
+// A module finishing a blocking move can be deaf for up to one revolution.
 constexpr unsigned long ENTER_TOTAL_TIMEOUT_MS = 10000;
 constexpr unsigned long ENTER_RETRY_MS = 250;
-// How long the freshly flashed application may take to come up (it may
-// auto-home first) before the caller re-applies display state and rescans.
 constexpr unsigned long BOOT_SETTLE_MS = 500;
-// How long to probe m<id>s after FINISH lost its ACK: a running application
-// proves the verify succeeded (only a verified FINISH or RESET clears the
-// boot flag), but it may be busy auto-homing right after boot.
 constexpr unsigned long APP_PROBE_TIMEOUT_MS = 4000;
 
-// CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection, no xorout) —
-// identical to ota_crc16_byte() in the bootloader's codec.h.
 uint16_t crc16Byte(uint16_t crc, uint8_t data) {
     crc ^= (uint16_t)data << 8;
     for (uint8_t i = 0; i < 8; i++) {
-        crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021)
+                             : (uint16_t)(crc << 1);
     }
     return crc;
 }
 
-// CRC-32 IEEE (reflected 0xEDB88320, init/xorout 0xFFFFFFFF) — the value
-// Python's binascii.crc32 produces over the application image.
 uint32_t crc32Byte(uint32_t crc, uint8_t data) {
     crc ^= data;
     for (uint8_t i = 0; i < 8; i++) {
@@ -99,7 +70,6 @@ int base64Value(char c) {
     return -1;
 }
 
-// NACK error codes (protocol.h ERR_*), for log/status messages only.
 const char* nackName(uint8_t code) {
     switch (code) {
         case 1: return "crc";
@@ -112,11 +82,9 @@ const char* nackName(uint8_t code) {
 }
 
 void otaLog(const String& line) {
-    WebSerialConsole::Scope scope(WebSerial, sourceMaster);
-    Serial.println(line);
+    busTraceLine(BusSource::Master, line);
 }
 
-// Append one logical byte to the wire buffer, escape-encoded.
 void putEscaped(uint8_t* wire, size_t& n, uint8_t b) {
     if (b == kEsc) {
         wire[n++] = kEsc;
@@ -132,10 +100,80 @@ void putEscaped(uint8_t* wire, size_t& n, uint8_t b) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
+// Command interpretation
+// ---------------------------------------------------------------------------
+
+bool ModuleFirmwareSession::handleAction(JsonObject command, bool scanActive) {
+    const char* action = command["action"] | "";
+
+    if (strcmp(action, "begin") == 0) {
+        const int module = command["module"] | command["module_id"] | -1;
+        if (module <= 0 || module > 255 ||
+            !beginImage(static_cast<uint8_t>(module))) {
+            otaLog("[OTA] begin refused (invalid module id or a session is active)");
+        }
+        return true;
+    }
+
+    if (strcmp(action, "chunk") == 0) {
+        const char* data = command["data"] | "";
+        if (!appendChunk(data)) {
+            otaLog("[OTA] chunk refused (no collection in progress or invalid data)");
+            return true;
+        }
+        // Milestone publishes (every full kilobyte) keep collection progress
+        // visible without a publish per chunk.
+        return (imageSize() & 1023) == 0;
+    }
+
+    if (strcmp(action, "flash") == 0) {
+        if (active()) {
+            otaLog("[OTA] a session is already running");
+            return false;
+        }
+        if (!imageReady()) {
+            otaLog("[OTA] flash requested without a complete image");
+            return true;
+        }
+        if (scanActive) {
+            otaLog("[OTA] a bus scan is in progress, refusing to flash");
+            return true;
+        }
+
+        otaLog("[OTA] flash session starting for module " +
+               String((int)targetModule()));
+        // Blocking for ~20-25 s. Other bus commands are refused by Master
+        // Control while active(), and the pump keeps MQTT alive here.
+        runSession();
+        return true;
+    }
+
+    if (strcmp(action, "cancel") == 0) {
+        cancel();
+        return true;
+    }
+
+    if (strcmp(action, "reset") == 0) {
+        const int module = command["module"] | command["module_id"] | -1;
+        if (module <= 0 || module > 255) {
+            otaLog("[OTA] invalid module id in reset command");
+        } else if (active() || collecting()) {
+            otaLog("[OTA] reset refused (session active or image being collected)");
+        } else {
+            resetModule(static_cast<uint8_t>(module));
+        }
+        return true;
+    }
+
+    otaLog("[OTA] unknown firmware action");
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Status reporting
 // ---------------------------------------------------------------------------
 
-const char* SlaveFlasher::stateString() const {
+const char* ModuleFirmwareSession::stateString() const {
     switch (state_) {
         case State::Collecting: return "collecting";
         case State::Entering:   return "entering";
@@ -149,19 +187,20 @@ const char* SlaveFlasher::stateString() const {
     }
 }
 
-int SlaveFlasher::progress() const {
+int ModuleFirmwareSession::progress() const {
     if (state_ == State::Done) return 100;
-    if ((state_ == State::Flashing || state_ == State::Verifying) && totalPages_ > 0) {
+    if ((state_ == State::Flashing || state_ == State::Verifying) &&
+        totalPages_ > 0) {
         return (int)((uint32_t)pagesDone_ * 100UL / totalPages_);
     }
     return -1;
 }
 
 // ---------------------------------------------------------------------------
-// Image assembly (MQTT "begin" / "chunk")
+// Image assembly
 // ---------------------------------------------------------------------------
 
-bool SlaveFlasher::beginImage(uint8_t moduleId) {
+bool ModuleFirmwareSession::beginImage(uint8_t moduleId) {
     if (active_ || moduleId == 0) return false;
     collecting_ = true;
     moduleId_ = moduleId;
@@ -175,14 +214,14 @@ bool SlaveFlasher::beginImage(uint8_t moduleId) {
     return true;
 }
 
-bool SlaveFlasher::appendChunk(const char* base64) {
+bool ModuleFirmwareSession::appendChunk(const char* base64) {
     if (!collecting_ || active_) return false;
 
     size_t decoded = 0;
     for (const char* p = base64; *p != '\0'; p++) {
         const char c = *p;
-        if (c == '=') break;                       // end of padded stream
-        if (c == '\r' || c == '\n' || c == ' ') continue;  // tolerate transport cruft
+        if (c == '=') break;
+        if (c == '\r' || c == '\n' || c == ' ') continue;
 
         const int v = base64Value(c);
         if (v < 0) {
@@ -215,7 +254,7 @@ bool SlaveFlasher::appendChunk(const char* base64) {
 // Session
 // ---------------------------------------------------------------------------
 
-bool SlaveFlasher::runSession() {
+bool ModuleFirmwareSession::runSession() {
     if (active_) return false;
     if (!imageReady()) {
         fail("no firmware image collected");
@@ -235,8 +274,8 @@ bool SlaveFlasher::runSession() {
     error_ = "";
 
     otaLog("OTA: flashing " + String((unsigned)size_) + " bytes (" +
-           String((unsigned)totalPages_) + " pages, crc32 " + String(imageCrc_, HEX) +
-           ") to module " + String((int)moduleId_));
+           String((unsigned)totalPages_) + " pages, crc32 " +
+           String(imageCrc_, HEX) + ") to module " + String((int)moduleId_));
 
     bool ok = false;
     const bool appAcked = enterBootloader();
@@ -248,19 +287,20 @@ bool SlaveFlasher::runSession() {
     if (ok) collecting_ = false;  // the image is no longer needed
     active_ = false;
 
-    // Drain stray frame bytes so the main loop's SLAVE console echo does not
-    // print binary junk after the session.
+    // Drain stray frame bytes before the shared line reader sees binary junk.
     rs485Reset();
+    if (ok) recover();
 
-    otaLog("OTA: session " + String(ok ? "complete" : stateString() == "failed" ? "failed" : "ended"));
+    const char* outcome =
+        ok ? "complete" : strcmp(stateString(), "failed") == 0 ? "failed" : "ended";
+    otaLog(String("OTA: session ") + outcome);
     notify();
     return ok;
 }
 
-void SlaveFlasher::cancel() {
+void ModuleFirmwareSession::cancel() {
     if (active_) {
-        // The session checks this between pages and in its wait loops.
-        abort_ = true;
+        abort_ = true;  // checked between pages and in wait loops
         return;
     }
     if (collecting_) {
@@ -272,7 +312,7 @@ void SlaveFlasher::cancel() {
     }
 }
 
-bool SlaveFlasher::resetModule(uint8_t moduleId) {
+bool ModuleFirmwareSession::resetModule(uint8_t moduleId) {
     if (active_ || collecting_) return false;
 
     active_ = true;
@@ -282,13 +322,13 @@ bool SlaveFlasher::resetModule(uint8_t moduleId) {
     setState(State::Entering);
     notify();
 
-    // The module must already sit in the bootloader (boot flag armed or a
-    // blank application); a running application never answers binary frames.
+    // A running application never answers binary frames: the module must
+    // already sit in the bootloader.
     bool found = false;
     for (uint8_t attempt = 0; attempt < MAX_RETRIES && !found; attempt++) {
         Response r;
-        if (exchange(kCmdPing, nullptr, 0, r) && r.cmd == kRespAck && r.len == 3 &&
-            r.payload[1] == moduleId_) {
+        if (exchange(kCmdPing, nullptr, 0, r) && r.cmd == kRespAck &&
+            r.len == 3 && r.payload[1] == moduleId_) {
             found = true;
         }
     }
@@ -299,8 +339,6 @@ bool SlaveFlasher::resetModule(uint8_t moduleId) {
         return false;
     }
 
-    // CMD_RESET clears the boot flag and reboots into the (intact)
-    // application.
     Response r;
     sendFrame(kCmdReset, nullptr, 0);
     const bool acked = recvResponse(RESPONSE_TIMEOUT_MS, r) && r.cmd == kRespAck;
@@ -320,73 +358,64 @@ bool SlaveFlasher::resetModule(uint8_t moduleId) {
 // Session steps
 // ---------------------------------------------------------------------------
 
-// Places the ASCII entry command. Returns true when the application
-// explicitly acked it; silence is a normal outcome (the module may already
-// be in the bootloader, or deaf while a blocking move finishes) and is
-// handled by waitForBootloader().
-bool SlaveFlasher::enterBootloader() {
+bool ModuleFirmwareSession::enterBootloader() {
     setState(State::Entering);
     notify();
-    // If the module is already in the bootloader (flag armed from a
-    // previous attempt), skip the ASCII entry command and proceed.
+
+    // A boot flag armed by an earlier attempt means the module is already in
+    // the bootloader.
     {
         Response r;
         if (exchange(kCmdPing, nullptr, 0, r) && r.cmd == kRespAck &&
             r.len == 3 && r.payload[1] == moduleId_) {
-            otaLog("OTA: module " + String((int)moduleId_) + " already in bootloader");
+            otaLog("OTA: module " + String((int)moduleId_) +
+                   " already in bootloader");
             pumpDelay(ENTER_BOOT_DELAY_MS);
             return true;
         }
     }
-    otaLog("OTA: asking module " + String((int)moduleId_) + " to enter the bootloader");
-    rs485Send("m" + String((int)moduleId_) + "b");
+
+    otaLog("OTA: asking module " + String((int)moduleId_) +
+           " to enter the bootloader");
+    rs485SendLine("m" + String((int)moduleId_) + "b");
 
     const String reply = readAsciiLine(150);
     const String expect = "m" + String((int)moduleId_) + "b:1";
     if (reply.startsWith(expect)) {
-        // The application arms the flag, replies, then resets ~100 ms
-        // later; wait out that sequence.
+        // The application arms the flag, replies, then resets ~100 ms later.
         pumpDelay(ENTER_BOOT_DELAY_MS);
         return true;
     }
     return false;
 }
 
-bool SlaveFlasher::waitForBootloader(bool appAcked) {
+bool ModuleFirmwareSession::waitForBootloader(bool appAcked) {
     const unsigned long deadline = millis() + ENTER_TOTAL_TIMEOUT_MS;
 
     while ((long)(millis() - deadline) < 0 && !abort_) {
         Response r;
-        if (exchange(kCmdPing, nullptr, 0, r) && r.cmd == kRespAck && r.len == 3 &&
-            r.payload[1] == moduleId_) {
-            if (r.payload[0] != kOtaProtocolVersion) {
+        if (exchange(kCmdPing, nullptr, 0, r) && r.cmd == kRespAck &&
+            r.len == 3 && r.payload[1] == moduleId_) {
+            if (r.payload[0] != kOtaVersion) {
                 fail("module " + String((int)moduleId_) +
                      " bootloader protocol " + String((int)r.payload[0]) +
-                     ", expected " + String((int)kOtaProtocolVersion));
+                     ", expected " + String((int)kOtaVersion));
                 return false;
             }
             bootloaderVersion_ = r.payload[0];
-            // staying == 1: the boot flag is armed (or the application
-            // looks erased) — full update mode. staying == 0: the
-            // bootloader is in its 500 ms boot window with the flag clear;
-            // START_UPDATE arms the flag, so this counts as ready too.
-            // The PING just refreshed that window, keeping the module in
-            // the bootloader until START_UPDATE arrives milliseconds
-            // later.
+            // staying=1: boot flag armed; staying=0: boot window, which
+            // START_UPDATE arms before it closes.
             otaLog("OTA: bootloader ready (protocol " +
-                   String((int)r.payload[0]) +
-                   ", staying=" + String((int)r.payload[2]) + ")");
+                   String((int)r.payload[0]) + ", staying=" +
+                   String((int)r.payload[2]) + ")");
             return true;
         }
 
         if (!appAcked) {
-            // No bootloader answer (yet): the module is either in the
-            // application and deaf while a blocking move finishes (it never
-            // saw the first request), or the request itself was lost.
-            // Re-send it; a module already in update mode ignores the
-            // non-frame ASCII bytes harmlessly.
-            rs485Send("m" + String((int)moduleId_) + "b");
-            if (readAsciiLine(150).startsWith("m" + String((int)moduleId_) + "b:1")) {
+            // The application may be deaf while a blocking move finishes.
+            rs485SendLine("m" + String((int)moduleId_) + "b");
+            if (readAsciiLine(150).startsWith(
+                    "m" + String((int)moduleId_) + "b:1")) {
                 appAcked = true;
                 pumpDelay(ENTER_BOOT_DELAY_MS);
                 continue;
@@ -400,28 +429,22 @@ bool SlaveFlasher::waitForBootloader(bool appAcked) {
     return false;
 }
 
-bool SlaveFlasher::startUpdate() {
+bool ModuleFirmwareSession::startUpdate() {
     const uint8_t payload[6] = {
-        (uint8_t)(size_ >> 8),
-        (uint8_t)(size_ & 0xFF),
-        (uint8_t)(imageCrc_ >> 24),
-        (uint8_t)(imageCrc_ >> 16),
-        (uint8_t)(imageCrc_ >> 8),
-        (uint8_t)(imageCrc_ & 0xFF),
+        (uint8_t)(size_ >> 8),  (uint8_t)(size_ & 0xFF),
+        (uint8_t)(imageCrc_ >> 24), (uint8_t)(imageCrc_ >> 16),
+        (uint8_t)(imageCrc_ >> 8),  (uint8_t)(imageCrc_ & 0xFF),
     };
 
     for (uint8_t attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         Response r;
         if (exchange(kCmdStartUpdate, payload, sizeof(payload), r)) {
             if (r.cmd == kRespAck) {
-                // The boot flag is armed on the module now: a power cut
-                // from this point on re-enters the bootloader.
+                // The boot flag is armed from here: a power cut is recoverable.
                 setState(State::Flashing);
                 notify();
                 return true;
             }
-            // A NACK here is definitive (length/address rejection);
-            // retrying the same frame cannot change it.
             failNack("start update", r.payload[0]);
             return false;
         }
@@ -430,25 +453,20 @@ bool SlaveFlasher::startUpdate() {
     return false;
 }
 
-bool SlaveFlasher::writePages() {
+bool ModuleFirmwareSession::writePages() {
     uint8_t payload[2 + PAGE_SIZE];
 
     for (uint16_t page = 0; page < totalPages_; page++) {
-        // runSession() performs the cancellation once the abort is seen
-        // here (pageAttempted_ tells it whether the application can still
-        // be assumed intact).
         if (abort_) return false;
 
         payload[0] = (uint8_t)(page >> 8);
         payload[1] = (uint8_t)(page & 0xFF);
         const uint16_t offset = page * PAGE_SIZE;
         const uint16_t chunk = (uint16_t)((size_ - offset) < PAGE_SIZE
-                                             ? (size_ - offset)
-                                             : PAGE_SIZE);
+                                              ? (size_ - offset)
+                                              : PAGE_SIZE);
         memcpy(payload + 2, image_ + offset, chunk);
         if (chunk < PAGE_SIZE) {
-            // The tail page is padded with erased-flash bytes; only the
-            // image's own bytes count towards the final CRC.
             memset(payload + 2 + chunk, 0xFF, PAGE_SIZE - chunk);
         }
 
@@ -460,8 +478,8 @@ bool SlaveFlasher::writePages() {
                 if (r.cmd == kRespAck) {
                     written = true;
                 } else {
-                    // NACK: length/sequence/address rejection — definitive.
-                    failNack(("page " + String((unsigned)page)).c_str(), r.payload[0]);
+                    failNack(("page " + String((unsigned)page)).c_str(),
+                             r.payload[0]);
                     return false;
                 }
             }
@@ -471,28 +489,25 @@ bool SlaveFlasher::writePages() {
             }
         }
         if (!written) {
-            fail("page " + String((unsigned)page) + " was not acknowledged after " +
+            fail("page " + String((unsigned)page) +
+                 " was not acknowledged after " +
                  String((int)MAX_RETRIES) + " attempts");
             return false;
         }
 
         pagesDone_ = page + 1;
-        // Progress roughly every 8th page (about once a second) so the
-        // status publishes and console lines stay modest.
         if ((pagesDone_ & 7) == 0 || pagesDone_ == totalPages_) notify();
     }
     return true;
 }
 
-bool SlaveFlasher::finishUpdate() {
+bool ModuleFirmwareSession::finishUpdate() {
     setState(State::Verifying);
     notify();
 
     const uint8_t payload[4] = {
-        (uint8_t)(imageCrc_ >> 24),
-        (uint8_t)(imageCrc_ >> 16),
-        (uint8_t)(imageCrc_ >> 8),
-        (uint8_t)(imageCrc_ & 0xFF),
+        (uint8_t)(imageCrc_ >> 24), (uint8_t)(imageCrc_ >> 16),
+        (uint8_t)(imageCrc_ >> 8),  (uint8_t)(imageCrc_ & 0xFF),
     };
 
     for (uint8_t attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -500,30 +515,22 @@ bool SlaveFlasher::finishUpdate() {
         sendFrame(kCmdFinish, payload, sizeof(payload));
         if (recvResponse(FINISH_TIMEOUT_MS, r)) {
             if (r.cmd == kRespAck) {
-                // The slave verified its flash against the image CRC,
-                // cleared the boot flag and reset itself into the new
-                // application.
                 setState(State::Done);
                 otaLog("OTA: module " + String((int)moduleId_) +
                        " verified the image and rebooted");
                 pumpDelay(BOOT_SETTLE_MS);
                 return true;
             }
-            // ERR_VERIFY: the flash content does not match the image. The
-            // module stays in the bootloader with the boot flag armed; a
-            // re-run of "flash" recovers it (the image is kept).
             failNack("final verify", r.payload[0]);
             return false;
         }
     }
 
-    // No ACK. If it was merely lost, the module has already verified,
-    // cleared its flag and rebooted — only a successful FINISH (or RESET)
-    // clears the flag, so a running application proves success. A fresh
-    // boot may auto-home first (blocking, deaf), so probe for a while.
+    // A lost FINISH ACK still proves success: only a verified FINISH or RESET
+    // clears the boot flag. A fresh application may auto-home first.
     const unsigned long deadline = millis() + APP_PROBE_TIMEOUT_MS;
     while ((long)(millis() - deadline) < 0 && !abort_) {
-        rs485Send("m" + String((int)moduleId_) + "s");
+        rs485SendLine("m" + String((int)moduleId_) + "s");
         const String state = readAsciiLine(200);
         if (state.startsWith("m" + String((int)moduleId_) + "s:")) {
             setState(State::Done);
@@ -534,26 +541,19 @@ bool SlaveFlasher::finishUpdate() {
         pumpDelay(ENTER_RETRY_MS);
     }
 
-    if (abort_) return false;  // runSession() reports the cancellation
+    if (abort_) return false;
     fail("no acknowledgement of the final verify");
     return false;
 }
 
-void SlaveFlasher::cancelSession(bool pagesAttempted) {
+void ModuleFirmwareSession::cancelSession(bool pagesAttempted) {
     if (!pagesAttempted) {
-        // Nothing was placed on the flash: the application is intact, so
-        // return the module to it. (The boot flag may be armed from
-        // START_UPDATE, which RESET clears again.)
         otaLog("OTA: cancelled before any page was written, resetting the module");
         Response r;
         sendFrame(kCmdReset, nullptr, 0);
-        recvResponse(RESPONSE_TIMEOUT_MS, r);  // best effort; it resets on ACK
+        recvResponse(RESPONSE_TIMEOUT_MS, r);  // best effort
         pumpDelay(BOOT_SETTLE_MS);
     } else {
-        // A page may have been written even if its ACK never arrived, so
-        // the application can no longer be assumed intact. Leave the module
-        // in the bootloader (its boot flag is armed) — re-running "flash"
-        // recovers it, UPDI is the last resort.
         otaLog("OTA: cancelled after pages were written; module stays in the bootloader");
     }
     setState(State::Cancelled);
@@ -561,17 +561,11 @@ void SlaveFlasher::cancelSession(bool pagesAttempted) {
 }
 
 // ---------------------------------------------------------------------------
-// Wire I/O
+// Wire I/O through Rs485Link
 // ---------------------------------------------------------------------------
 
-// Sends [0xAA][addr][cmd][len][payload][crc16 hi][crc16 lo] with everything
-// after the sync byte escape-encoded. Drives the transceiver directly:
-// rs485Send() is for ASCII command lines only (it appends '\n' and its echo
-// drop counts exactly that line's bytes). Our own transmission loops back on
-// RX in half-duplex; recvResponse() simply skips echoed frames, because a
-// valid echo always carries the command code (0x01..0x05) rather than a
-// response code (0x81/0x82), so no timing assumptions are needed.
-void SlaveFlasher::sendFrame(uint8_t cmd, const uint8_t* payload, uint8_t len) {
+void ModuleFirmwareSession::sendFrame(uint8_t cmd, const uint8_t* payload,
+                                      uint8_t len) {
     uint8_t wire[kWireMax];
     size_t n = 0;
     wire[n++] = kSync;
@@ -589,35 +583,12 @@ void SlaveFlasher::sendFrame(uint8_t cmd, const uint8_t* payload, uint8_t len) {
     putEscaped(wire, n, (uint8_t)(crc >> 8));
     putEscaped(wire, n, (uint8_t)crc);
 
-    digitalWrite(RS485_DE, HIGH);
-    delayMicroseconds(100);          // driver settle, as in rs485Send()
-    Serial1.write(wire, n);          // blocks until all bytes are queued
-    Serial1.flush();                // wait for the last stop bit
-    // Drain our own half-duplex echo so recvResponse() only sees the
-    // slave's reply.  Without this the echo (which starts with the same
-    // 0xAA sync) can be mis-parsed and the real response missed.
-    {
-        unsigned long echoStart = millis();
-        size_t dropped = 0;
-        while (dropped < n && (millis() - echoStart) < 5) {
-            if (Serial1.available()) {
-                Serial1.read();
-                dropped++;
-            } else {
-                yield();
-            }
-        }
-    }
-    delayMicroseconds(100);
-    digitalWrite(RS485_DE, LOW);
+    // Echo frames are skipped by response code: an echoed command is 0x01..05
+    // while an ACK/NACK is 0x81/0x82.
+    rs485SendFrame(wire, n);
 }
 
-// Reads one response frame within timeoutMs. Sync-searches through noise and
-// our own echoed transmission, decodes escapes on the fly (an illegal
-// sequence resynchronises), verifies CRC-16 and accepts only frames that are
-// addressed to us and carry a response code. Pumping keeps MQTT alive (and
-// delivers a mid-session "cancel") while the bus is quiet.
-bool SlaveFlasher::recvResponse(unsigned long timeoutMs, Response& out) {
+bool ModuleFirmwareSession::recvResponse(unsigned long timeoutMs, Response& out) {
     const unsigned long deadline = millis() + timeoutMs;
 
     bool inSync = false;
@@ -627,8 +598,8 @@ bool SlaveFlasher::recvResponse(unsigned long timeoutMs, Response& out) {
 
     while ((long)(millis() - deadline) < 0) {
         pump();
-        while (Serial1.available() > 0) {
-            const uint8_t raw = (uint8_t)Serial1.read();
+        while (rs485Available() > 0) {
+            const uint8_t raw = (uint8_t)rs485ReadByte();
 
             if (!inSync) {
                 if (raw == kSync) {
@@ -647,21 +618,21 @@ bool SlaveFlasher::recvResponse(unsigned long timeoutMs, Response& out) {
                 } else if (raw == kEscM) {
                     b = kForbidden;
                 } else {
-                    inSync = false;   // illegal escape code
+                    inSync = false;
                     continue;
                 }
             } else if (raw == kEsc) {
                 escaping = true;
                 continue;
             } else if (raw == kForbidden) {
-                inSync = false;       // 'm' can never appear raw in a frame
+                inSync = false;
                 continue;
             } else {
                 b = raw;
             }
 
             if (count >= sizeof(body)) {
-                inSync = false;       // overlong frame
+                inSync = false;
                 continue;
             }
             body[count++] = b;
@@ -669,14 +640,15 @@ bool SlaveFlasher::recvResponse(unsigned long timeoutMs, Response& out) {
             if (count >= 3) {
                 const uint8_t len = body[2];
                 if (len > kRespMaxPayload) {
-                    inSync = false;   // not a response frame
+                    inSync = false;
                     continue;
                 }
                 if (count == (uint8_t)(3 + len + 2)) {
-                    // Complete frame: check CRC and ownership.
                     uint16_t crc = 0xFFFF;
-                    for (uint8_t i = 0; i < 3 + len; i++) crc = crc16Byte(crc, body[i]);
-                    const uint16_t rx = (uint16_t)((body[3 + len] << 8) | body[3 + len + 1]);
+                    for (uint8_t i = 0; i < 3 + len; i++)
+                        crc = crc16Byte(crc, body[i]);
+                    const uint16_t rx =
+                        (uint16_t)((body[3 + len] << 8) | body[3 + len + 1]);
                     if (crc == rx && body[0] == moduleId_ &&
                         (body[1] == kRespAck || body[1] == kRespNack)) {
                         out.cmd = body[1];
@@ -684,16 +656,17 @@ bool SlaveFlasher::recvResponse(unsigned long timeoutMs, Response& out) {
                         memcpy(out.payload, body + 3, len);
                         return true;
                     }
-                    inSync = false;   // CRC mismatch or not ours
+                    inSync = false;
                 }
             }
         }
-        delay(1);   // let WiFi and lower-priority tasks breathe
+        delay(1);
     }
     return false;
 }
 
-bool SlaveFlasher::exchange(uint8_t cmd, const uint8_t* payload, uint8_t len, Response& out) {
+bool ModuleFirmwareSession::exchange(uint8_t cmd, const uint8_t* payload,
+                                     uint8_t len, Response& out) {
     sendFrame(cmd, payload, len);
     return recvResponse(RESPONSE_TIMEOUT_MS, out);
 }
@@ -702,10 +675,10 @@ bool SlaveFlasher::exchange(uint8_t cmd, const uint8_t* payload, uint8_t len, Re
 // Helpers
 // ---------------------------------------------------------------------------
 
-String SlaveFlasher::readAsciiLine(unsigned long timeoutMs) {
+String ModuleFirmwareSession::readAsciiLine(unsigned long timeoutMs) {
     const unsigned long deadline = millis() + timeoutMs;
     while ((long)(millis() - deadline) < 0) {
-        String line = rs485read();
+        const String line = rs485ReadLine();
         if (line.length() > 0) return line;
         pump();
         delay(1);
@@ -713,7 +686,7 @@ String SlaveFlasher::readAsciiLine(unsigned long timeoutMs) {
     return "";
 }
 
-void SlaveFlasher::pumpDelay(unsigned long ms) {
+void ModuleFirmwareSession::pumpDelay(unsigned long ms) {
     const unsigned long deadline = millis() + ms;
     while ((long)(millis() - deadline) < 0) {
         pump();
@@ -721,13 +694,14 @@ void SlaveFlasher::pumpDelay(unsigned long ms) {
     }
 }
 
-void SlaveFlasher::fail(const String& message) {
+void ModuleFirmwareSession::fail(const String& message) {
     error_ = message;
     setState(State::Failed);
     otaLog("OTA: " + message);
     notify();
 }
 
-void SlaveFlasher::failNack(const char* what, uint8_t code) {
-    fail(String(what) + " rejected by the bootloader (nack: " + nackName(code) + ")");
+void ModuleFirmwareSession::failNack(const char* what, uint8_t code) {
+    fail(String(what) + " rejected by the bootloader (nack: " +
+         nackName(code) + ")");
 }

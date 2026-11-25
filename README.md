@@ -30,7 +30,8 @@ pio run -t upload       # flash the ESP32
 
 Configuration lives in `include/secrets.h` (WiFi + MQTT) and
 `include/Config.h` (pins, timeouts, scan slice). The default MQTT prefix is
-`splitflap`.
+`splitflap`. The build uses `min_spiffs.csv` so the web console and OTA stack
+fit in two 1.875 MB application slots on the 4 MB flash.
 
 ## Web console
 
@@ -47,7 +48,7 @@ The console is reachable at **http://splitflap.local/** (mDNS) and at the IP
 the master prints on the USB console.
 
 The library only knows two output categories (`DEBUG` and `USER`); the master
-registers its own in `src/Sources.cpp`, so the web UI can label and colour them:
+registers its own in `src/BusTrace.cpp`, so the web UI can label and colour them:
 
 | Category | Tag | Badge | Colour | Used for |
 | --- | --- | --- | --- | --- |
@@ -56,10 +57,7 @@ registers its own in `src/Sources.cpp`, so the web UI can label and colour them:
 | `slave` | `S` | SLV | `#34d399` | Answers the slave modules send back |
 
 ```cpp
-{
-  WebSerialConsole::Scope scope(WebSerial, sourceMaster);
-  Serial.println("m1s");     // shown as an MST line in the browser
-}
+busTraceLine(BusSource::Master, "m1s");  // shown as an MST line in the browser
 ```
 
 ## MQTT contract
@@ -81,7 +79,7 @@ registers its own in `src/Sources.cpp`, so the web UI can label and colour them:
 {
   "state": "online",
   "text": "HELLO",
-  "version": "1.1.0.0",
+  "version": "1.1.0.1",
   "bus_compat": 1,
   "mqtt_compat": 1,
   "compat": 1,
@@ -146,8 +144,8 @@ intact application. Recovery details are in the slave `PROTOCOL.md`.
 ```c
 #define MASTER_BUS_COMPAT 1         // shared with the slave (slave <-> master)
 #define MASTER_MQTT_COMPAT 1        // shared with Home Assistant (MQTT JSON)
-#define MASTER_RELEASE "0.0"        // per-repo release
-#define MASTER_VERSION "1.1.0.0"    // <bus>.<mqtt>.<release>
+#define MASTER_RELEASE "0.1"        // per-repo release
+#define MASTER_VERSION "1.1.0.1"    // <bus>.<mqtt>.<release>
 #define OTA_PROTOCOL_VERSION 1      // bootloader framing generation
 ```
 
@@ -163,11 +161,14 @@ with the bootloader framing or boot policy. See the slave's
 | Path | Purpose |
 | --- | --- |
 | `src/main.cpp` | Setup and loop |
-| `src/display/` | Module discovery, moves, position maps, settled-move refresh |
-| `src/RS485.cpp` | Half-duplex line send/receive |
-| `src/network/WifiMqttHandler.cpp` | MQTT commands, status payload, discovery |
-| `src/ota/SlaveFlasher.cpp` | Image assembly and the blocking RS485 flash session |
-| `src/Sources.cpp` | Output categories (HA, bus master, bus slave) of the web console |
+| `src/BusTrace.cpp` | Console source registration and tagged line/byte emission |
+| `src/Rs485Link.cpp` | Single owner of DE, echo, ASCII lines and binary frames |
+| `src/ModuleRuntime.cpp` | Module records, scan, moves, position readback and one tick seam |
+| `src/ContractSnapshot.cpp` | Version composition, state reply parsing and legacy aliases |
+| `src/MasterControl.cpp` | MQTT command interpretation, bus effects and Status Payload |
+| `src/network/WifiMqttHandler.cpp` | WiFi/MQTT transport adapter and discovery |
+| `src/ModuleFirmwareSession.cpp` | Image assembly, bootloader session, recovery |
+| `src/network/OtaHandler.cpp` | ESP32 ArduinoOTA adapter |
 | `include/Config.h` | Pins, bus timing, scan limits |
-| `include/Sources.h` | Handles of the registered output categories |
 | `include/Version.h` | Compatibility/release constants |
+| `GLOSSARY.md` | Domain vocabulary used by the master modules |

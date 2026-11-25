@@ -13,7 +13,7 @@
 // The master is the bridge, so it carries both numbers. RELEASE is this
 // repository's own release inside those generations.
 //
-// The published version is "<bus>.<mqtt>.<release>", e.g. 1.1.0.0. The status
+// The published version is "<bus>.<mqtt>.<release>", e.g. 1.1.0.1. The status
 // payload repeats both generations explicitly, so Home Assistant never has to
 // parse the string.
 
@@ -27,12 +27,12 @@
 #define MASTER_MQTT_COMPAT 1
 
 // Bump for every master release; independent of the slave and HA releases.
-#define MASTER_RELEASE "0.0"
+#define MASTER_RELEASE "0.1"
 
 #define MASTER_VERSION SF_STRINGIFY(MASTER_BUS_COMPAT) "." \
                        SF_STRINGIFY(MASTER_MQTT_COMPAT) "." MASTER_RELEASE
 
-// OTA binary protocol generation implemented by SlaveFlasher. This is
+// OTA binary protocol generation implemented by ModuleFirmwareSession. This is
 // separate from both application compatibility generations: it changes only
 // when the bootloader framing, commands or boot policy change. It must match
 // BOOTLOADER_VERSION in the slave's bootloader/src/protocol.h.
