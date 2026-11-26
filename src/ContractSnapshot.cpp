@@ -52,7 +52,7 @@ void applyMasterContract(JsonObject status) {
 
 void applyModuleVersion(JsonObject module, const ModuleVersionSnapshot& version) {
     if (version.version.length() > 0) {
-        module["fw_version"] = version.version;
+        module["fw_version"] = version.version.c_str();
     }
     if (version.busCompat > 0) {
         module["fw_bus_compat"] = version.busCompat;
@@ -83,4 +83,22 @@ void applyFirmwareStatus(JsonObject status, const FirmwareStatusSnapshot& sessio
     if (session.error != nullptr && session.error[0] != '\0') {
         ota["error"] = session.error;
     }
+}
+
+void applyMasterFirmwareStatus(JsonObject status,
+                               const MasterFirmwareStatusSnapshot& session) {
+    JsonObject masterOta = status["master_ota"].to<JsonObject>();
+    masterOta["state"] = session.state;
+    masterOta["progress"] = session.progress;
+    masterOta["received"] = session.received;
+    masterOta["size"] = session.size;
+    masterOta["version"] = masterContractSnapshot().version;
+    masterOta["target_version"] =
+        session.targetVersion != nullptr ? session.targetVersion : "";
+    masterOta["error"] = session.error != nullptr ? session.error : "";
+}
+
+void applyMasterIp(JsonObject status, const char* ip) {
+    // Additive field for ArduinoOTA recovery; empty until WiFi associates.
+    status["ip"] = ip != nullptr ? ip : "";
 }

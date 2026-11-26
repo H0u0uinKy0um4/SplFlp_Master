@@ -35,6 +35,17 @@ struct FirmwareStatusSnapshot {
     const char* error = "";
 };
 
+// Master self-update. `version` is always the running master version; only
+// `target_version` names the image being collected or applied.
+struct MasterFirmwareStatusSnapshot {
+    const char* state = "idle";
+    int progress = 0;
+    uint32_t received = 0;
+    uint32_t size = 0;
+    const char* targetVersion = "";
+    const char* error = "";
+};
+
 MasterContractSnapshot masterContractSnapshot();
 
 // Parse an m<id>s reply. Older slaves stop after position; newer ones append
@@ -50,3 +61,6 @@ void applyModuleVersion(JsonObject module, const ModuleVersionSnapshot& version)
 
 // Render the module firmware session object used by the panel.
 void applyFirmwareStatus(JsonObject status, const FirmwareStatusSnapshot& session);
+void applyMasterFirmwareStatus(JsonObject status,
+                               const MasterFirmwareStatusSnapshot& session);
+void applyMasterIp(JsonObject status, const char* ip);

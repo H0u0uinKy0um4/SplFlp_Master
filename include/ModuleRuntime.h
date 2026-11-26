@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <etl/vector.h>
 #include "Config.h"
+#include "LinkAdapter.h"
 
 // One live record for a Slave Module. The master keeps the last requested
 // `flap` separate from the actual flap derived from a trusted position, so a
@@ -45,12 +46,13 @@ struct Module {
     uint8_t busyMisses = 0;
 };
 
-// Deep module for the live state of every Slave Module. Callers submit effects
-// (display, move, scan, refresh) and poll one tick seam; the query order, move
-// windows, EEPROM table, scan slice and settled-move recovery stay inside.
+// Deep module for every Slave Module effect. Callers submit intent; the RS485
+// Bus command grammar, move windows, cached flap, scan slices, query order and
+// settled-move readback stay inside. The link sits behind a seam so the same
+// interface can be tested with a fake bus and clock.
 class ModuleRuntime {
   public:
-    ModuleRuntime();
+    explicit ModuleRuntime(LinkAdapter& link);
     void begin();
     void loadEepromModules();
 
@@ -65,23 +67,31 @@ class ModuleRuntime {
 
     void updateModules();
     bool refreshModule(uint16_t id);
-    bool setModuleChar(uint16_t id, char flap);
     const etl::vector<Module, 256>& getModules() const;
 
-    // Record an in-flight move so bus queries for that module are deferred
-    // until it should have finished. Sending is never delayed: the slave
-    // queues commands while it turns.
-    void markMovingFlap(uint16_t id, char flap);
-    void markMovingIndex(uint16_t id, int index);
-    void markMovingPos(uint16_t id, long pos);
-    void markMovingHome(uint16_t id);
+    // ---- Slave Module effects ----
+    // Each method composes its own RS485 Bus command, records the move window
+    // when the action turns the drum, and schedules its own readback.
+    bool moveToFlap(uint16_t id, char flap);
+    bool moveToIndex(uint16_t id, int index);
+    bool moveHome(uint16_t id);
+    bool moveSteps(uint16_t id, long steps);
+    bool recordIndex(uint16_t id, int index);
+    bool applyHomeOffset(uint16_t id, int offset);
+    bool clearPositionMap(uint16_t id);
+    bool writePosition(uint16_t id, int index, long pos);
+    bool writeDrumCharacter(uint16_t id, int index, char flap);
+    bool writeDrum(uint16_t id, const String& drum);
 
-    // Defer a whole-module refresh until a blocking move has settled.
-    void deferRefresh(unsigned long delayMs);
+    // Bootloader arm and post-session application probe. Binary OTA framing,
+    // PING/ACK and link resets stay in Module Firmware Session.
+    bool enterBootloader(uint16_t id);
+    bool probeApplicationState(uint16_t id);
 
     // One seam for time-driven work: settled-move readback and a deferred
     // whole-module refresh. Returns true when state changed and the caller
-    // should publish a Status Payload.
+    // should publish a Status Payload. `now` is also the clock for windows
+    // opened by effects.
     bool tick(unsigned long now);
 
     // Restore the last requested character after a firmware session, marking
@@ -91,7 +101,14 @@ class ModuleRuntime {
 
   private:
     Module* getModule(uint16_t id);
+    bool validId(uint16_t id) const;
+    bool sendLine(uint16_t id, const String& body);
     void extendBusy(Module& mod, unsigned long estMs);
+    void markFlapMove(uint16_t id, char flap);
+    void markIndexMove(uint16_t id, int index);
+    void markStepMove(uint16_t id, long pos);
+    void markHomeMove(uint16_t id);
+    void deferRefresh(unsigned long delayMs);
     long flapTargetPos(const Module& mod, int index) const;
     void deriveActualFlap(Module& mod) const;
     void finishScan();
@@ -102,6 +119,8 @@ class ModuleRuntime {
     void sortModules();
     bool refreshSettledMoves(unsigned long now);
 
+    LinkAdapter& link;
+    unsigned long nowMs = 0;
     etl::vector<Module, 256> modules;
     static constexpr int ADDR_STORED_IDS = 0;
     static constexpr size_t EEPROM_SIZE = 512;
@@ -114,8 +133,7 @@ class ModuleRuntime {
     unsigned long scanStartMs = 0;
     uint8_t scanFoundMask[(ID_END / 8) + 1] = {};
 
-    // millis() deadline for a refresh postponed behind a blocking move.
-    // 0 means no refresh is pending.
+    // Deadline for a refresh postponed behind a blocking move. 0 = none.
     unsigned long refreshDueMs = 0;
 };
 

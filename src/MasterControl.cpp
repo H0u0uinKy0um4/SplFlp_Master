@@ -6,7 +6,8 @@
 #include "Config.h"
 #include "ContractSnapshot.h"
 #include "ModuleRuntime.h"
-#include "Rs485Link.h"
+#include "ota/Esp32FirmwareUpdater.h"
+#include "ota/MasterFirmwareSession.h"
 #include "ota/ModuleFirmwareSession.h"
 
 MasterControl masterControl;
@@ -21,16 +22,30 @@ constexpr unsigned long SCAN_PUBLISH_INTERVAL_MS = 1000;
 }  // namespace
 
 void MasterControl::begin() {
-    // All session policy stays in ModuleFirmwareSession; these are the only
-    // hooks it needs from the rest of the master.
+    // All session policy stays in the firmware sessions; these are the only
+    // hooks they need from the rest of the master.
     firmwareSession.setPump([]() { masterControl.pump(); });
     firmwareSession.setNotifier([]() { masterControl.publishStatus(); });
     firmwareSession.setRecovery(
         [](uint8_t id) { moduleRuntime.recoverAfterFirmware(id); });
+
+    masterFirmwareSession.setUpdater(&esp32FirmwareUpdater);
+    // finish() only verifies the digest and arms the boot marker; re-entering
+    // client.loop() from the MQTT callback is unsafe and unnecessary here.
+    masterFirmwareSession.setPump(nullptr);
+    masterFirmwareSession.setNotifier([]() { masterControl.publishStatus(); });
+    masterFirmwareSession.setReboot([]() { ESP.restart(); });
+    masterFirmwareSession.setLogger([](const String& line) {
+        busTraceLine(BusSource::Master, "[MasterOTA] " + line);
+    });
 }
 
 bool MasterControl::busAvailable(const char* commandName) {
-    if (!firmwareSession.active()) return true;
+    // Collection is non-blocking and must not stop display traffic. Only a
+    // master image being written to the OTA slot owns the device exclusively.
+    if (!firmwareSession.active() && !masterFirmwareSession.applying()) {
+        return true;
+    }
     busTraceLine(BusSource::Master,
                  String("[OTA] flash session in progress, ignoring ") +
                      commandName);
@@ -70,6 +85,16 @@ void MasterControl::onCommand(const String& topic, const String& message) {
                                          moduleRuntime.isScanning())) {
             publishStatus();
         }
+    } else if (topic == masterTopics::MASTER_FIRMWARE_TOPIC) {
+        JsonDocument doc;
+        if (deserializeJson(doc, message)) {
+            busTraceLine(BusSource::Master,
+                         "Failed to parse master firmware command");
+            return;
+        }
+        // The session publishes its own state transitions, including progress
+        // milestones and rejections.
+        masterFirmwareSession.handleAction(doc.as<JsonObject>());
     }
 }
 
@@ -92,7 +117,7 @@ void MasterControl::handleDisplay(const String& message) {
             if (id <= 0 || id > 255 || flap == '\0') continue;
             if (flap == '\r' || flap == '\n') flap = ' ';
 
-            moduleRuntime.setModuleChar(static_cast<uint8_t>(id), flap);
+            moduleRuntime.moveToFlap(static_cast<uint16_t>(id), flap);
             assembled += flap;
         }
         currentText = assembled;
@@ -127,87 +152,55 @@ void MasterControl::handleCalibrate(const String& message) {
     String act = String(action);
     act.toLowerCase();
 
-    // The slave performs moves as a blocking loop. Track which actions move
-    // so the readback is deferred until the module should have landed.
+    // Moves are blocking on the slave. Module Runtime owns the command, the
+    // move window and the readback; `moved` only controls publishing here.
     bool moved = false;
     bool refreshed = false;
 
     if (act == "goto") {
         if (doc["index"].is<int>()) {
-            const int index = doc["index"].as<int>();
-            rs485SendLine("m" + String(moduleId) + "+" + String(index));
-            moduleRuntime.markMovingIndex(moduleId, index);
-            moved = true;
+            moved = moduleRuntime.moveToIndex(moduleId, doc["index"].as<int>());
         } else if (doc["flap"].is<const char*>()) {
             char flap = doc["flap"].as<const char*>()[0];
             if (flap == '\r' || flap == '\n') flap = ' ';
-            rs485SendLine("m" + String(moduleId) + "-" + String(flap));
-            moduleRuntime.markMovingFlap(moduleId, flap);
-            moved = true;
+            moved = moduleRuntime.moveToFlap(moduleId, flap);
         }
     } else if (act == "home") {
-        rs485SendLine("m" + String(moduleId) + "h");
-        moduleRuntime.markMovingHome(moduleId);
-        moved = true;
+        moved = moduleRuntime.moveHome(moduleId);
     } else if (act == "step") {
         if (doc["steps"].is<int>()) {
-            const int steps = doc["steps"].as<int>();
-            rs485SendLine("m" + String(moduleId) + "g" + String(steps));
-            moduleRuntime.markMovingPos(moduleId, steps);
-            moved = true;
+            moved = moduleRuntime.moveSteps(moduleId, doc["steps"].as<int>());
         }
     } else if (act == "record") {
         if (doc["index"].is<int>()) {
-            // Index 0 redefines homeOffset on the slave. Do not send the old
-            // compatibility write: it overwrote flap 0 with position 0.
-            rs485SendLine("m" + String(moduleId) + "r" +
-                          String(doc["index"].as<int>()));
+            moduleRuntime.recordIndex(moduleId, doc["index"].as<int>());
         }
     } else if (act == "apply") {
         if (doc["home_offset"].is<int>() || doc["homeOffset"].is<int>()) {
             const int hoff = doc["home_offset"].is<int>()
                                  ? doc["home_offset"].as<int>()
                                  : doc["homeOffset"].as<int>();
-            rs485SendLine("m" + String(moduleId) + "o" + String(hoff));
-            delay(50);
+            moduleRuntime.applyHomeOffset(moduleId, hoff);
         }
         if (doc["clear_map"].is<bool>() && doc["clear_map"].as<bool>()) {
-            rs485SendLine("m" + String(moduleId) + "e*");
-            delay(50);
+            moduleRuntime.clearPositionMap(moduleId);
         }
         if (doc["positions"].is<JsonObject>()) {
             JsonObject pos = doc["positions"].as<JsonObject>();
             for (JsonPair p : pos) {
-                rs485SendLine("m" + String(moduleId) + "w" +
-                              String(p.key().c_str()) + ":" +
-                              String(p.value().as<int>()));
-                delay(30);
+                moduleRuntime.writePosition(
+                    moduleId, String(p.key().c_str()).toInt(),
+                    p.value().as<int>());
             }
         }
-        rs485SendLine("m" + String(moduleId) + "h");
-        moduleRuntime.markMovingHome(moduleId);
-        moved = true;
+        moved = moduleRuntime.moveHome(moduleId);
     } else if (act == "clear_map" || act == "clearmap") {
-        rs485SendLine("m" + String(moduleId) + "e*");
+        moduleRuntime.clearPositionMap(moduleId);
     } else if (act == "drum_write" || act == "drumwrite" ||
                act == "write_drum") {
         const String drum = doc["drum"] | "";
-        bool valid = drum.length() == DRUM_SIZE;
-        for (int i = 0; valid && i < DRUM_SIZE; i++) {
-            if (drum[i] == '\r' || drum[i] == '\n') valid = false;
-        }
-        if (valid) {
-            for (int i = 0; i < DRUM_SIZE; i++) {
-                rs485SendLine("m" + String(moduleId) + "f" + String(i) + ":" +
-                              String(drum[i]));
-                delay(30);
-            }
-            // Read the drum back so a failed write is visible instead of
-            // leaving a stale cached flap list.
-            delay(100);
-            refreshed = moduleRuntime.refreshModule(
-                static_cast<uint16_t>(moduleId));
-        } else {
+        refreshed = moduleRuntime.writeDrum(moduleId, drum);
+        if (!refreshed) {
             busTraceLine(BusSource::Master,
                          "Invalid drum length: " + String(drum.length()) +
                              " (expected " + String(DRUM_SIZE) + ")");
@@ -222,20 +215,45 @@ void MasterControl::handleCalibrate(const String& message) {
             static_cast<uint16_t>(moduleId));
     }
 
-    if (moved) {
+    if (moved || refreshed) {
         publishStatus();
-        moduleRuntime.deferRefresh(MOVE_SETTLE_MS);
     } else {
-        if (!refreshed) moduleRuntime.updateModules();
+        moduleRuntime.updateModules();
+        publishStatus();
+    }
+}
+
+void MasterControl::endCommand() {
+    inCommand_ = false;
+    if (publishPending_) {
+        publishPending_ = false;
         publishStatus();
     }
 }
 
 void MasterControl::publishStatus() {
+    // Publishing from inside PubSubClient's callback fails and can drop the
+    // connection. Coalesce every state change in one command into one publish
+    // after the callback returns.
+    if (inCommand_) {
+        publishPending_ = true;
+        return;
+    }
+
     JsonDocument doc;
     doc["state"] = "online";
     doc["text"] = currentText;
     applyMasterContract(doc.as<JsonObject>());
+    applyMasterIp(doc.as<JsonObject>(), localIp_.c_str());
+
+    MasterFirmwareStatusSnapshot masterFirmware;
+    masterFirmware.state = masterFirmwareSession.stateString();
+    masterFirmware.progress = masterFirmwareSession.progress();
+    masterFirmware.received = masterFirmwareSession.received();
+    masterFirmware.size = masterFirmwareSession.size();
+    masterFirmware.targetVersion = masterFirmwareSession.targetVersion();
+    masterFirmware.error = masterFirmwareSession.error();
+    applyMasterFirmwareStatus(doc.as<JsonObject>(), masterFirmware);
 
     doc["scanning"] = moduleRuntime.isScanning();
     const int scanProgress = moduleRuntime.scanProgress();

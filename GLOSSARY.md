@@ -51,3 +51,7 @@ _Avoid_: MQTT callback, command handler
 **Module Firmware Session**:
 One image-assembly and bootloader exchange for a **Slave Module**, including boot policy, retry, cancellation and recovery of its **Display Command** state.
 _Avoid_: OTA flasher, updater
+
+**Master Firmware Session**:
+One self-update of the master application. It streams a **Firmware Image** into the inactive OTA slot, verifies its SHA-256 before the boot marker is armed, and publishes its own progress in the **Status Payload**.
+_Avoid_: master updater, self-flash task

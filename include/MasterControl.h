@@ -10,6 +10,8 @@ static constexpr char SCAN_TOPIC[] = "splitflap/command/scan";
 static constexpr char UPDATE_TOPIC[] = "splitflap/command/update";
 static constexpr char CALIBRATE_TOPIC[] = "splitflap/command/calibrate";
 static constexpr char FIRMWARE_TOPIC[] = "splitflap/command/firmware";
+static constexpr char MASTER_FIRMWARE_TOPIC[] =
+    "splitflap/command/master_firmware";
 }  // namespace masterTopics
 
 // Deep module for MQTT control. Command interpretation, bus effects, scan and
@@ -24,7 +26,13 @@ class MasterControl {
     void setPublisher(PublishHook publisher) { publisher_ = publisher; }
     void setPump(PumpHook pump) { pump_ = pump; }
     void pump() { if (pump_) pump_(); }
+    void setLocalIp(const String& ip) { localIp_ = ip; }
 
+    // PubSubClient cannot publish from inside its callback. The MQTT adapter
+    // brackets onCommand() with these, and the single resulting status publish
+    // is flushed after client.loop() returns.
+    void beginCommand() { inCommand_ = true; }
+    void endCommand();
     void onCommand(const String& topic, const String& message);
     void publishStatus();
     // Drive scan slices, runtime state and the heartbeat. Returns after one
@@ -37,10 +45,13 @@ class MasterControl {
     bool busAvailable(const char* commandName);
 
     String currentText;
+    String localIp_;
     unsigned long lastStatusPublish = 0;
     unsigned long lastScanPublish = 0;
     PublishHook publisher_ = nullptr;
     PumpHook pump_ = nullptr;
+    bool inCommand_ = false;
+    bool publishPending_ = false;
 };
 
 extern MasterControl masterControl;

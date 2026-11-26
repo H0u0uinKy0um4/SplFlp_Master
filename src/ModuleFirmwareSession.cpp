@@ -1,5 +1,6 @@
 #include "ota/ModuleFirmwareSession.h"
 #include "BusTrace.h"
+#include "ModuleRuntime.h"
 #include "Rs485Link.h"
 #include "Version.h"
 #include <cstring>
@@ -377,7 +378,7 @@ bool ModuleFirmwareSession::enterBootloader() {
 
     otaLog("OTA: asking module " + String((int)moduleId_) +
            " to enter the bootloader");
-    rs485SendLine("m" + String((int)moduleId_) + "b");
+    moduleRuntime.enterBootloader(moduleId_);
 
     const String reply = readAsciiLine(150);
     const String expect = "m" + String((int)moduleId_) + "b:1";
@@ -413,7 +414,7 @@ bool ModuleFirmwareSession::waitForBootloader(bool appAcked) {
 
         if (!appAcked) {
             // The application may be deaf while a blocking move finishes.
-            rs485SendLine("m" + String((int)moduleId_) + "b");
+            moduleRuntime.enterBootloader(moduleId_);
             if (readAsciiLine(150).startsWith(
                     "m" + String((int)moduleId_) + "b:1")) {
                 appAcked = true;
@@ -530,7 +531,7 @@ bool ModuleFirmwareSession::finishUpdate() {
     // clears the boot flag. A fresh application may auto-home first.
     const unsigned long deadline = millis() + APP_PROBE_TIMEOUT_MS;
     while ((long)(millis() - deadline) < 0 && !abort_) {
-        rs485SendLine("m" + String((int)moduleId_) + "s");
+        moduleRuntime.probeApplicationState(moduleId_);
         const String state = readAsciiLine(200);
         if (state.startsWith("m" + String((int)moduleId_) + "s:")) {
             setState(State::Done);

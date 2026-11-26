@@ -6,10 +6,26 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
-ModuleRuntime moduleRuntime;
+namespace {
 
-ModuleRuntime::ModuleRuntime() = default;
+// The one adapter over the real bus. Tests inject their own LinkAdapter into
+// a separate ModuleRuntime, so this never has to be swapped at runtime.
+class RealLinkAdapter final : public LinkAdapter {
+  public:
+    void sendLine(const String& line) override { rs485SendLine(line); }
+    String readLine(bool trim) override { return rs485ReadLine(trim); }
+    bool rxBusy() override { return rs485RxBusy(); }
+};
+
+RealLinkAdapter realLinkAdapter;
+
+}  // namespace
+
+ModuleRuntime moduleRuntime(realLinkAdapter);
+
+ModuleRuntime::ModuleRuntime(LinkAdapter& link) : link(link) {}
 
 // ---------------------------------------------------------------------------
 // Module record
@@ -60,18 +76,29 @@ void ModuleRuntime::sortModules() {
               [](const Module& a, const Module& b) { return a.id < b.id; });
 }
 
+bool ModuleRuntime::validId(uint16_t id) const {
+    return id >= ID_BEGIN && id <= ID_END;
+}
+
+bool ModuleRuntime::sendLine(uint16_t id, const String& body) {
+    if (!validId(id)) return false;
+    link.sendLine(String("m") + String(id) + body);
+    return true;
+}
+
 void ModuleRuntime::begin() {
     EEPROM.begin(EEPROM_SIZE);
+    nowMs = millis();
     loadEepromModules();
     sortModules();
 }
 
 // ---------------------------------------------------------------------------
-// Display effects
+// Slave Module effects
 // ---------------------------------------------------------------------------
 
-bool ModuleRuntime::setModuleChar(uint16_t id, char flap) {
-    if (id <= 0 || id >= 256 || flap == '\0') return false;
+bool ModuleRuntime::moveToFlap(uint16_t id, char flap) {
+    if (!validId(id) || flap == '\0') return false;
 
     // A newline or carriage return would terminate the RS485 line early.
     if (flap == '\r' || flap == '\n') flap = ' ';
@@ -86,21 +113,110 @@ bool ModuleRuntime::setModuleChar(uint16_t id, char flap) {
         return false;
     }
 
-    String message;
-    message += 'm';
-    message += String(id);
-    message += '-';
-    message += flap;
-    rs485SendLine(message);
+    String body = "-";
+    body += flap;
+    if (!sendLine(id, body)) return false;
 
     // The slave queues lines while it turns; only queries wait out the move.
-    markMovingFlap(id, flap);
+    markFlapMove(id, flap);
     delay(BUS_RELEASE_MS);
 
     // The next status payload reports the requested character while the motor
     // is still turning; settled-move readback replaces it with the real flap.
     if (mod) mod->flap = flap;
+    deferRefresh(MOVE_SETTLE_MS);
     return true;
+}
+
+bool ModuleRuntime::moveToIndex(uint16_t id, int index) {
+    String body = "+";
+    body += String(index);
+    if (!sendLine(id, body)) return false;
+    markIndexMove(id, index);
+    delay(BUS_RELEASE_MS);
+    deferRefresh(MOVE_SETTLE_MS);
+    return true;
+}
+
+bool ModuleRuntime::moveHome(uint16_t id) {
+    if (!sendLine(id, "h")) return false;
+    markHomeMove(id);
+    delay(BUS_RELEASE_MS);
+    deferRefresh(MOVE_SETTLE_MS);
+    return true;
+}
+
+bool ModuleRuntime::moveSteps(uint16_t id, long steps) {
+    String body = "g";
+    body += String(steps);
+    if (!sendLine(id, body)) return false;
+    markStepMove(id, steps);
+    delay(BUS_RELEASE_MS);
+    deferRefresh(MOVE_SETTLE_MS);
+    return true;
+}
+
+bool ModuleRuntime::recordIndex(uint16_t id, int index) {
+    // Index 0 redefines homeOffset on the slave. Do not send the old
+    // compatibility write: it overwrote flap 0 with position 0.
+    String body = "r";
+    body += String(index);
+    return sendLine(id, body);
+}
+
+bool ModuleRuntime::applyHomeOffset(uint16_t id, int offset) {
+    String body = "o";
+    body += String(offset);
+    if (!sendLine(id, body)) return false;
+    delay(50);
+    return true;
+}
+
+bool ModuleRuntime::clearPositionMap(uint16_t id) {
+    if (!sendLine(id, "e*")) return false;
+    delay(50);
+    return true;
+}
+
+bool ModuleRuntime::writePosition(uint16_t id, int index, long pos) {
+    String body = "w";
+    body += String(index);
+    body += ':';
+    body += String(pos);
+    if (!sendLine(id, body)) return false;
+    delay(30);
+    return true;
+}
+
+bool ModuleRuntime::writeDrumCharacter(uint16_t id, int index, char flap) {
+    if (flap == '\r' || flap == '\n') return false;
+    String body = "f";
+    body += String(index);
+    body += ':';
+    body += flap;
+    if (!sendLine(id, body)) return false;
+    delay(30);
+    return true;
+}
+
+bool ModuleRuntime::writeDrum(uint16_t id, const String& drum) {
+    if (drum.length() != DRUM_SIZE) return false;
+    for (int i = 0; i < DRUM_SIZE; i++) {
+        if (drum[i] == '\r' || drum[i] == '\n') return false;
+        if (!writeDrumCharacter(id, i, drum[i])) return false;
+    }
+    // Read the drum back so a failed write is visible instead of leaving a
+    // stale cached flap list.
+    delay(100);
+    return refreshModule(id);
+}
+
+bool ModuleRuntime::enterBootloader(uint16_t id) {
+    return sendLine(id, "b");
+}
+
+bool ModuleRuntime::probeApplicationState(uint16_t id) {
+    return sendLine(id, "s");
 }
 
 void ModuleRuntime::recoverAfterFirmware(uint8_t id) {
@@ -113,8 +229,8 @@ void ModuleRuntime::recoverAfterFirmware(uint8_t id) {
     }
 
     // The freshly booted module may auto-home first (a blocking move).
-    markMovingHome(id);
-    if (lastFlap != '\0') setModuleChar(id, lastFlap);
+    markHomeMove(id);
+    if (lastFlap != '\0') moveToFlap(id, lastFlap);
 }
 
 // ---------------------------------------------------------------------------
@@ -275,17 +391,16 @@ long ModuleRuntime::flapTargetPos(const Module& mod, int index) const {
 }
 
 void ModuleRuntime::extendBusy(Module& mod, unsigned long estMs) {
-    const unsigned long now = millis();
     // Commands queued behind a running move extend the deadline.
-    if (mod.busyUntilMs != 0 && (long)(mod.busyUntilMs - now) > 0) {
+    if (mod.busyUntilMs != 0 && (long)(mod.busyUntilMs - nowMs) > 0) {
         mod.busyUntilMs += estMs;
     } else {
-        mod.busyUntilMs = now + estMs;
+        mod.busyUntilMs = nowMs + estMs;
     }
     mod.busyMisses = 0;
 }
 
-void ModuleRuntime::markMovingFlap(uint16_t id, char flap) {
+void ModuleRuntime::markFlapMove(uint16_t id, char flap) {
     Module* mod = getModule(id);
     if (!mod) return;
 
@@ -297,10 +412,10 @@ void ModuleRuntime::markMovingFlap(uint16_t id, char flap) {
         extendBusy(*mod, MOVE_SETTLE_MS);
         return;
     }
-    markMovingPos(id, target);
+    markStepMove(id, target);
 }
 
-void ModuleRuntime::markMovingIndex(uint16_t id, int index) {
+void ModuleRuntime::markIndexMove(uint16_t id, int index) {
     Module* mod = getModule(id);
     if (!mod) return;
 
@@ -309,10 +424,10 @@ void ModuleRuntime::markMovingIndex(uint16_t id, int index) {
         extendBusy(*mod, MOVE_SETTLE_MS);
         return;
     }
-    markMovingPos(id, target);
+    markStepMove(id, target);
 }
 
-void ModuleRuntime::markMovingPos(uint16_t id, long pos) {
+void ModuleRuntime::markStepMove(uint16_t id, long pos) {
     Module* mod = getModule(id);
     if (!mod) return;
 
@@ -327,7 +442,7 @@ void ModuleRuntime::markMovingPos(uint16_t id, long pos) {
     extendBusy(*mod, (unsigned long)dist + MOVE_MARGIN_MS);
 }
 
-void ModuleRuntime::markMovingHome(uint16_t id) {
+void ModuleRuntime::markHomeMove(uint16_t id) {
     Module* mod = getModule(id);
     if (!mod) return;
 
@@ -340,11 +455,12 @@ void ModuleRuntime::markMovingHome(uint16_t id) {
 }
 
 void ModuleRuntime::deferRefresh(unsigned long delayMs) {
-    refreshDueMs = millis() + delayMs;
+    refreshDueMs = nowMs + delayMs;
 }
 
 bool ModuleRuntime::tick(unsigned long now) {
-    if (refreshDueMs != 0 && (long)(now - refreshDueMs) >= 0) {
+    nowMs = now;
+    if (refreshDueMs != 0 && (long)(nowMs - refreshDueMs) >= 0) {
         refreshDueMs = 0;
         updateModules();
         return true;
@@ -362,7 +478,7 @@ bool ModuleRuntime::refreshSettledMoves(unsigned long now) {
             mod.busyMisses = 0;
         } else if (++mod.busyMisses < 2) {
             // The move outlived its estimate (or the module went silent).
-            mod.busyUntilMs = millis() + MOVE_SETTLE_MS;
+            mod.busyUntilMs = now + MOVE_SETTLE_MS;
         } else {
             mod.online = false;
             mod.busyMisses = 0;
@@ -382,7 +498,7 @@ bool ModuleRuntime::sendQueryAndWait(uint16_t id, uint16_t timeoutMs,
     // A module inside its move window cannot answer: the slave blocks in its
     // step loop while it turns. Keep the cached state instead of timing out
     // and reporting the module offline.
-    if (mod.busyUntilMs != 0 && (long)(millis() - mod.busyUntilMs) < 0) {
+    if (mod.busyUntilMs != 0 && (long)(nowMs - mod.busyUntilMs) < 0) {
         return mod.online;
     }
 
@@ -390,10 +506,10 @@ bool ModuleRuntime::sendQueryAndWait(uint16_t id, uint16_t timeoutMs,
     message += 'm';
     message += String(id);
     message += 'd';
-    rs485SendLine(message);
+    link.sendLine(message);
 
     // Only accept a response carrying the id we asked for.
-    const String configPrefix = "m" + String(id) + ":";
+    const String configPrefix = String("m") + String(id) + ":";
     unsigned long startTime = millis();
     bool gotConfig = false;
 
@@ -406,8 +522,8 @@ bool ModuleRuntime::sendQueryAndWait(uint16_t id, uint16_t timeoutMs,
     const uint32_t previousPos = mod.currentPos;
     const bool previousPositionKnown = mod.positionKnown;
 
-    while (millis() - startTime < timeoutMs || rs485RxBusy()) {
-        const String response = rs485ReadLine();
+    while (millis() - startTime < timeoutMs || link.rxBusy()) {
+        const String response = link.readLine();
         if (response.length() > 0 && response.startsWith(configPrefix)) {
             mod = Module(response);
             if (mod.flap == '\0') mod.flap = previousFlap;
@@ -423,12 +539,12 @@ bool ModuleRuntime::sendQueryAndWait(uint16_t id, uint16_t timeoutMs,
     // The drum query must be read untrimmed: the stock drum starts with a
     // blank flap and trimming would shift every flap index. Its response has
     // no id prefix, so length is the only validation available.
-    rs485SendLine("m" + String(id) + "l");
+    link.sendLine(String("m") + String(id) + "l");
 
     startTime = millis();
     bool gotDrum = false;
-    while (millis() - startTime < timeoutMs || rs485RxBusy()) {
-        const String drum = rs485ReadLine(false);
+    while (millis() - startTime < timeoutMs || link.rxBusy()) {
+        const String drum = link.readLine(false);
         if (drum.length() > 0) {
             if (drum.length() == DRUM_SIZE) {
                 mod.flapList = drum;
@@ -443,13 +559,13 @@ bool ModuleRuntime::sendQueryAndWait(uint16_t id, uint16_t timeoutMs,
     delay(BUS_RELEASE_MS);
 
     // State query: m<id>s:<pos>:<busy>:<position_known>[:<compat>:<version>]
-    rs485SendLine("m" + String(id) + "s");
+    link.sendLine(String("m") + String(id) + "s");
 
-    const String statePrefix = "m" + String(id) + "s:";
+    const String statePrefix = String("m") + String(id) + "s:";
     startTime = millis();
     bool gotState = false;
-    while (millis() - startTime < timeoutMs || rs485RxBusy()) {
-        const String resp = rs485ReadLine();
+    while (millis() - startTime < timeoutMs || link.rxBusy()) {
+        const String resp = link.readLine();
         ModuleStateSnapshot parsed;
         if (parseModuleState(id, resp, parsed)) {
             mod.currentPos = parsed.currentPos;

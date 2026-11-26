@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include "BusTrace.h"
 #include "MasterControl.h"
+#include "Version.h"
 #include "secrets.h"
 
 namespace {
@@ -21,8 +22,11 @@ WiFiClient wifiClient;
 PubSubClient client(wifiClient);
 
 // PubSubClient needs room for the whole fixed header, topic-length bytes,
-// topic and payload. Grow once instead of silently dropping large statuses.
-size_t mqttBufferSize = 2048;
+// topic and payload. Master firmware chunks are base64-encoded in the client,
+// so reserve enough for a ~16 KB chunk before loop() parses it: growing the
+// buffer inside the callback would already be too late.
+constexpr size_t MQTT_BUFFER_SIZE = 24576;
+size_t mqttBufferSize = MQTT_BUFFER_SIZE;
 
 constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 constexpr unsigned long MQTT_RETRY_INTERVAL_MS = 5000;
@@ -31,8 +35,14 @@ unsigned long wifiRetryMs = 0;
 unsigned long mqttRetryMs = 0;
 bool wifiAtFullPower = false;
 
-constexpr char OFFLINE_WILL_PAYLOAD[] =
-    "{\"state\":\"offline\",\"modules\":[],\"modules_count\":0}";
+// The offline will is retained too, so it carries the same additive fields as
+// the live Status Payload. The version comes from Version.h, never a literal.
+String offlineWillPayload() {
+    return String("{\"state\":\"offline\",\"modules\":[],\"modules_count\":0,")
+           + "\"ip\":\"\",\"master_ota\":{\"state\":\"idle\",\"progress\":0,"
+           + "\"received\":0,\"size\":0,\"version\":\"" + MASTER_VERSION
+           + "\",\"target_version\":\"\",\"error\":\"\"}}";
+}
 
 // Firmware-side discovery duplicates the entities created by the Home
 // Assistant integration, so it is disabled by default.
@@ -113,6 +123,9 @@ bool ensureWifi() {
             WiFi.setTxPower(WIFI_POWER_15dBm);
             Serial.print("WiFi connected! IP address: ");
             Serial.println(WiFi.localIP());
+            // Additive status field: ArduinoOTA recovery needs the address.
+            masterControl.setLocalIp(WiFi.localIP().toString());
+            masterControl.publishStatus();
         }
         return true;
     }
@@ -142,9 +155,10 @@ bool ensureMqtt() {
     mqttRetryMs = now == 0 ? 1 : now;
 
     Serial.print("Attempting MQTT connection...");
+    const String offlineWill = offlineWillPayload();
     if (!client.connect(MQTT_CLIENT_ID, mqttUser, mqttPassword,
                         masterTopics::STATUS, 1, true,
-                        OFFLINE_WILL_PAYLOAD)) {
+                        offlineWill.c_str())) {
         Serial.printf("failed, rc=%d (retrying in %lus)\n", client.state(),
                       MQTT_RETRY_INTERVAL_MS / 1000UL);
         return false;
@@ -157,6 +171,7 @@ bool ensureMqtt() {
     client.subscribe(masterTopics::UPDATE_TOPIC);
     client.subscribe(masterTopics::CALIBRATE_TOPIC);
     client.subscribe(masterTopics::FIRMWARE_TOPIC);
+    client.subscribe(masterTopics::MASTER_FIRMWARE_TOPIC);
 
     publishDiscovery();
     masterControl.publishStatus();
@@ -170,7 +185,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
     // Tag the whole request as HA-originated on the web console, then hand
     // interpretation to the deep control module.
-    busTraceLine(BusSource::Ha, "<- " + String(topic) + " " + message);
+    busTraceLine(BusSource::Ha, formatCommandTrace(String(topic), message));
+    masterControl.beginCommand();
     masterControl.onCommand(String(topic), message);
 }
 
@@ -189,9 +205,8 @@ void setupMqtt() {
     masterControl.setPump([]() { client.loop(); });
     masterControl.begin();
 
-    // The firmware session blocks inside the MQTT callback for ~20-25 s.
-    // client.loop() is safe to re-enter here: the callback copies its payload
-    // before dispatching and all subscriptions are QoS 0.
+    // Command handling stays inside the callback, but status publishes are
+    // deferred until client.loop() returns (MasterControl::beginCommand/endCommand).
     Serial.println("setUp Mqtt");
 }
 
@@ -200,6 +215,9 @@ void handleMqtt() {
     if (!ensureMqtt()) return;
 
     client.loop();
+    // Publish after the callback has returned to PubSubClient. A pending flag
+    // survives a dropped connection and is flushed on the next loop pass.
+    masterControl.endCommand();
     if (!client.connected()) return;
 
     // Commands are served by the callback. Time-driven work (scan slices,

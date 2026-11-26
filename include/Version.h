@@ -23,11 +23,13 @@
 // Bump together with FW_BUS_COMPAT (slave include/FirmwareVersion.h).
 #define MASTER_BUS_COMPAT 1
 
-// Bump together with MQTT_COMPAT (HA const.py).
-#define MASTER_MQTT_COMPAT 1
+// Bump together with MQTT_COMPAT (HA const.py). The coordinated change to 2
+// is tagged `mqtt-compat-2`; old HA builds keep display traffic and warn.
+#define MASTER_MQTT_COMPAT 2
 
 // Bump for every master release; independent of the slave and HA releases.
-#define MASTER_RELEASE "0.1"
+// Reset to 0.0 for the MQTT compat 2 generation.
+#define MASTER_RELEASE "0.0"
 
 #define MASTER_VERSION SF_STRINGIFY(MASTER_BUS_COMPAT) "." \
                        SF_STRINGIFY(MASTER_MQTT_COMPAT) "." MASTER_RELEASE
